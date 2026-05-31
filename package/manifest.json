@@ -1,9 +1,9 @@
 {
     "name": "FidelityReviveFix",
-    "version_number": "0.1.1",
+    "version_number": "0.1.2",
     "author": "AngelcoMilk",
     "website_url": "https://github.com/AngelcoMilk/FidelityReviveFix",
-    "description": "Instant extraction-point revive for hosts, with optional client-side REPOFidelity compatibility protection for revive mod conflict bugs.",
+    "description": "Safe instant extraction-point revive for hosts, with optional REPOFidelity protection against revive mod conflict bugs.",
     "dependencies": [
         "BepInEx-BepInExPack-5.4.2305"
     ]

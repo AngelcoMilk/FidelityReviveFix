@@ -5,6 +5,8 @@
 FidelityReviveFix 可以作为一个普通的即时复活 mod 使用。  
 同时它为 [REPOFidelity](https://thunderstore.io/c/repo/p/Vippy/REPOFidelity/) 做了专门的兼容补丁，重点用于修复 REPOFidelity 与其他复活类 mod 同时使用时可能出现的冲突 bug，减少复活后卡入虚空、掉入虚空或卡在死亡视角的问题。
 
+默认使用安全即时复活：进入撤离点会立刻触发复活，但实际复活调用会等到当前帧和物理状态稳定后执行，以减少与 REPOFidelity 的相机、房间检测和后处理状态冲突。
+
 ### 多人安装建议
 
 - 正常多人使用时，通常只需要主机安装 FidelityReviveFix。
@@ -18,6 +20,8 @@ FidelityReviveFix 可以作为一个普通的即时复活 mod 使用。
 
 FidelityReviveFix can be used as a regular instant revive mod.  
 It also includes a dedicated compatibility patch for [REPOFidelity](https://thunderstore.io/c/repo/p/Vippy/REPOFidelity/). Its main purpose is to fix conflict bugs that can happen when REPOFidelity is used together with other revive mods, reducing cases where players get stuck, fall into the void, or remain in the death camera after being revived.
+
+By default it uses safe instant revive: entering the extraction point triggers revive immediately, but the actual vanilla revive call waits until the current frame and physics state are stable to reduce conflicts with REPOFidelity camera, room-check, and post-processing state.
 
 ### Multiplayer Install Guidance
 

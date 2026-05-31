@@ -16,7 +16,7 @@ namespace FidelityReviveFix
     {
         public const string PluginGuid = "AngelcoMilk.FidelityReviveFix";
         public const string PluginName = "FidelityReviveFix";
-        public const string PluginVersion = "0.1.1";
+        public const string PluginVersion = "0.1.2";
 
         internal static Plugin Instance;
         internal static ManualLogSource Log;
@@ -54,9 +54,19 @@ namespace FidelityReviveFix
             }
         }
 
-        internal void StartProtectionRoutine(PlayerAvatar player)
+        internal Coroutine StartReviveRoutine(IEnumerator routine)
         {
-            StartCoroutine(ClientReviveProtection.Run(player));
+            return StartCoroutine(routine);
+        }
+
+        internal Coroutine StartProtectionRoutine(PlayerAvatar player)
+        {
+            return StartCoroutine(ClientReviveProtection.Run(player));
+        }
+
+        internal Coroutine StartProtectionRoutine(PlayerAvatar player, bool hasExpectedPosition, Vector3 expectedPosition, string reason, bool allowPositionRepair)
+        {
+            return StartCoroutine(ClientReviveProtection.Run(player, hasExpectedPosition, expectedPosition, reason, allowPositionRepair));
         }
     }
 
@@ -67,9 +77,16 @@ namespace FidelityReviveFix
         Off
     }
 
+    internal enum ReviveTimingMode
+    {
+        SafeInstant,
+        SameFrame
+    }
+
     internal static class ModConfig
     {
         internal static ConfigEntry<bool> EnableInstantExtractionRevive;
+        internal static ConfigEntry<ReviveTimingMode> ReviveTimingModeEntry;
         internal static ConfigEntry<ClientProtectionMode> REPOFidelityClientProtection;
         internal static ConfigEntry<float> PostReviveProtectionWindow;
         internal static ConfigEntry<bool> DebugLogging;
@@ -80,20 +97,26 @@ namespace FidelityReviveFix
                 "Instant Revive",
                 "Enable Instant Extraction Revive",
                 true,
-                "Host/singleplayer only. When a triggered death head enters an extraction point, immediately calls the vanilla revive.");
+                "Host/singleplayer only. When a triggered death head enters an extraction point, immediately triggers the vanilla revive.");
+
+            ReviveTimingModeEntry = config.Bind(
+                "Instant Revive",
+                "Revive Timing Mode",
+                ReviveTimingMode.SafeInstant,
+                "SafeInstant queues the revive until the end of the current frame and one physics tick. SameFrame calls revive during PlayerDeathHead.Update like older instant revive mods.");
 
             REPOFidelityClientProtection = config.Bind(
                 "REPOFidelity Compatibility",
                 "REPOFidelity Client Protection",
                 ClientProtectionMode.Auto,
-                "Auto enables local post-revive protection only when Vippy.REPOFidelity is loaded. Always runs it after every revive. Off disables the client-side protection.");
+                "Auto enables local protection only when Vippy.REPOFidelity is loaded. Always runs it after every revive. Off disables the client-side compatibility protection.");
 
             PostReviveProtectionWindow = config.Bind(
                 "REPOFidelity Compatibility",
                 "Post Revive Protection Window",
                 0.75f,
                 new ConfigDescription(
-                    "Seconds to keep refreshing local camera/spectate state after the vanilla revive RPC. This happens after revive and does not delay the revive trigger.",
+                    "Seconds to keep refreshing local camera/spectate/position state around the vanilla revive. This does not add a visible revive delay.",
                     new AcceptableValueRange<float>(0.1f, 3.0f)));
 
             DebugLogging = config.Bind(
@@ -109,6 +132,11 @@ namespace FidelityReviveFix
                 ? 0.75f
                 : Mathf.Clamp(PostReviveProtectionWindow.Value, 0.1f, 3.0f);
         }
+
+        internal static ReviveTimingMode SafeReviveTimingMode()
+        {
+            return ReviveTimingModeEntry == null ? ReviveTimingMode.SafeInstant : ReviveTimingModeEntry.Value;
+        }
     }
 
     internal static class InstantReviveController
@@ -120,6 +148,7 @@ namespace FidelityReviveFix
         {
             internal bool ReviveCompleted;
             internal bool WasTriggered;
+            internal bool ReviveQueued;
             internal float LastAttemptTime;
             internal float NextDebugLogTime;
         }
@@ -135,6 +164,9 @@ namespace FidelityReviveFix
 
         private static readonly FieldInfo PlayerDeathHeadInExtractionPointField =
             typeof(PlayerDeathHead).GetField("inExtractionPoint", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        private static readonly FieldInfo PlayerDeathHeadPhysGrabObjectField =
+            typeof(PlayerDeathHead).GetField("physGrabObject", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
         private static readonly FieldInfo PlayerAvatarDeadSetField =
             typeof(PlayerAvatar).GetField("deadSet", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
@@ -176,6 +208,7 @@ namespace FidelityReviveFix
             {
                 state.ReviveCompleted = false;
                 state.WasTriggered = false;
+                state.ReviveQueued = false;
                 state.LastAttemptTime = 0f;
                 return;
             }
@@ -184,10 +217,11 @@ namespace FidelityReviveFix
             {
                 state.ReviveCompleted = false;
                 state.WasTriggered = true;
+                state.ReviveQueued = false;
                 state.LastAttemptTime = 0f;
             }
 
-            if (state.ReviveCompleted)
+            if (state.ReviveCompleted || state.ReviveQueued)
             {
                 return;
             }
@@ -214,26 +248,106 @@ namespace FidelityReviveFix
             }
 
             state.LastAttemptTime = Time.time;
-            if (TryRevive(head, state, roomCheckInside, headInside, fallbackInside))
-            {
-                state.ReviveCompleted = true;
-            }
-        }
 
-        private static bool TryRevive(PlayerDeathHead head, ReviveState state, bool roomCheckInside, bool headInside, bool fallbackInside)
-        {
+            if (ModConfig.SafeReviveTimingMode() == ReviveTimingMode.SameFrame || Plugin.Instance == null)
+            {
+                ExecuteReviveAttempt(head, state, roomCheckInside, headInside, fallbackInside, "same frame revive");
+                return;
+            }
+
+            state.ReviveQueued = true;
+            DebugLogState(state, "queued safe instant revive. roomCheck=" + roomCheckInside + ", headField=" + headInside + ", fallback=" + fallbackInside + ".");
             try
             {
-                SetBool(PlayerDeathHeadInExtractionPointField, head, true, "PlayerDeathHead.inExtractionPoint");
-                head.Revive();
-                bool succeeded = HasReviveClearlySucceeded(head);
-                DebugLogState(state, "Instant extraction revive attempt. roomCheck=" + roomCheckInside + ", headFieldBefore=" + headInside + ", fallback=" + fallbackInside + ", headFieldAfter=" + GetBool(PlayerDeathHeadInExtractionPointField, head, false, "PlayerDeathHead.inExtractionPoint") + ", triggeredAfter=" + IsTriggered(head) + ", playerDeadSet=" + GetPlayerBool(head, PlayerAvatarDeadSetField, "PlayerAvatar.deadSet") + ", playerIsDisabled=" + GetPlayerBool(head, PlayerAvatarIsDisabledField, "PlayerAvatar.isDisabled") + ", successObserved=" + succeeded + ".");
-                return succeeded;
+                Plugin.Instance.StartReviveRoutine(RunSafeInstantRevive(head, state));
             }
             catch (Exception ex)
             {
-                Plugin.Log.LogWarning("Instant extraction revive failed: " + ex.Message);
-                return false;
+                state.ReviveQueued = false;
+                LogException("queue safe instant revive", ex);
+            }
+        }
+
+        private static IEnumerator RunSafeInstantRevive(PlayerDeathHead head, ReviveState state)
+        {
+            yield return new WaitForEndOfFrame();
+            yield return new WaitForFixedUpdate();
+
+            if (state != null)
+            {
+                state.ReviveQueued = false;
+            }
+
+            if (head == null ||
+                ModConfig.EnableInstantExtractionRevive == null ||
+                !ModConfig.EnableInstantExtractionRevive.Value ||
+                !IsHostOrSingleplayer() ||
+                !IsTriggered(head) ||
+                head.playerAvatar == null)
+            {
+                DebugLog("safe instant revive aborted before attempt; death head/player state changed.");
+                yield break;
+            }
+
+            bool roomCheckInside;
+            bool headInside;
+            bool fallbackInside;
+            bool inside = IsInsideExtractionPoint(head, out roomCheckInside, out headInside, out fallbackInside);
+            if (!inside)
+            {
+                DebugLogState(state, "safe instant revive aborted; head left extraction point. roomCheck=" + roomCheckInside + ", headField=" + headInside + ", fallback=" + fallbackInside + ".");
+                yield break;
+            }
+
+            ExecuteReviveAttempt(head, state, roomCheckInside, headInside, fallbackInside, "safe instant revive");
+        }
+
+        private static void ExecuteReviveAttempt(PlayerDeathHead head, ReviveState state, bool roomCheckInside, bool headInside, bool fallbackInside, string stage)
+        {
+            if (head == null || head.playerAvatar == null)
+            {
+                return;
+            }
+
+            PlayerAvatar player = head.playerAvatar;
+            Vector3 expectedPosition;
+            bool hasExpectedPosition = TryGetExpectedRevivePosition(head, out expectedPosition);
+
+            SetExtractionState(head, true);
+            ClientReviveProtection.ApplyImmediate(player, hasExpectedPosition, expectedPosition, "pre revive protection", false);
+
+            bool hadException;
+            bool successObserved;
+            bool completed = TryRevive(head, state, roomCheckInside, headInside, fallbackInside, stage, hasExpectedPosition, expectedPosition, out hadException, out successObserved);
+            if (completed && state != null)
+            {
+                state.ReviveCompleted = true;
+            }
+
+            StartLocalProtection(player, hasExpectedPosition, expectedPosition, hadException ? "failed revive protection" : "post revive protection", true);
+        }
+
+        private static bool TryRevive(PlayerDeathHead head, ReviveState state, bool roomCheckInside, bool headInside, bool fallbackInside, string stage, bool hasExpectedPosition, Vector3 expectedPosition, out bool hadException, out bool successObserved)
+        {
+            hadException = false;
+            successObserved = false;
+
+            try
+            {
+                DebugLogState(state, stage + ": revive attempt. roomCheck=" + roomCheckInside + ", headFieldBefore=" + headInside + ", fallback=" + fallbackInside + ", expectedPosition=" + FormatExpectedPosition(hasExpectedPosition, expectedPosition) + ", repoFidelityProtection=" + ClientReviveProtection.WouldRunFor(head.playerAvatar) + ".");
+                head.Revive();
+                successObserved = HasReviveClearlySucceeded(head);
+                bool multiplayer = IsMultiplayer();
+                DebugLogState(state, stage + ": revive returned. multiplayer=" + multiplayer + ", headFieldAfter=" + GetBool(PlayerDeathHeadInExtractionPointField, head, false, "PlayerDeathHead.inExtractionPoint") + ", triggeredAfter=" + IsTriggered(head) + ", playerDeadSet=" + GetPlayerBool(head, PlayerAvatarDeadSetField, "PlayerAvatar.deadSet") + ", playerIsDisabled=" + GetPlayerBool(head, PlayerAvatarIsDisabledField, "PlayerAvatar.isDisabled") + ", successObserved=" + successObserved + ".");
+                return successObserved || multiplayer;
+            }
+            catch (Exception ex)
+            {
+                hadException = true;
+                LogException(stage + " revive attempt", ex);
+                successObserved = HasReviveClearlySucceeded(head);
+                DebugLogState(state, stage + ": revive threw. triggeredAfter=" + IsTriggered(head) + ", playerDeadSet=" + GetPlayerBool(head, PlayerAvatarDeadSetField, "PlayerAvatar.deadSet") + ", playerIsDisabled=" + GetPlayerBool(head, PlayerAvatarIsDisabledField, "PlayerAvatar.isDisabled") + ", successObservedAfterException=" + successObserved + ".");
+                return successObserved;
             }
         }
 
@@ -376,6 +490,78 @@ namespace FidelityReviveFix
             return false;
         }
 
+        private static void SetExtractionState(PlayerDeathHead head, bool value)
+        {
+            SetBool(PlayerDeathHeadInExtractionPointField, head, value, "PlayerDeathHead.inExtractionPoint");
+
+            RoomVolumeCheck check = GetRoomVolumeCheck(head);
+            if (check != null)
+            {
+                SetBool(RoomVolumeCheckInExtractionPointField, check, value, "RoomVolumeCheck.inExtractionPoint");
+            }
+        }
+
+        private static bool TryGetExpectedRevivePosition(PlayerDeathHead head, out Vector3 position)
+        {
+            position = Vector3.zero;
+            if (head == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                PhysGrabObject physGrabObject = GetPhysGrabObject(head);
+                if (physGrabObject != null)
+                {
+                    position = physGrabObject.centerPoint - Vector3.up * 0.25f;
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLog("Expected revive position from death head PhysGrabObject failed: " + ex.Message);
+            }
+
+            position = head.transform.position;
+            return true;
+        }
+
+        private static PhysGrabObject GetPhysGrabObject(PlayerDeathHead head)
+        {
+            if (PlayerDeathHeadPhysGrabObjectField == null || head == null)
+            {
+                return null;
+            }
+
+            try
+            {
+                return PlayerDeathHeadPhysGrabObjectField.GetValue(head) as PhysGrabObject;
+            }
+            catch (Exception ex)
+            {
+                DebugLog("PlayerDeathHead.physGrabObject read failed: " + ex.Message);
+                return null;
+            }
+        }
+
+        private static void StartLocalProtection(PlayerAvatar player, bool hasExpectedPosition, Vector3 expectedPosition, string reason, bool allowPositionRepair)
+        {
+            if (Plugin.Instance == null || !ClientReviveProtection.WouldRunFor(player))
+            {
+                return;
+            }
+
+            try
+            {
+                Plugin.Instance.StartProtectionRoutine(player, hasExpectedPosition, expectedPosition, reason, allowPositionRepair);
+            }
+            catch (Exception ex)
+            {
+                LogException(reason, ex);
+            }
+        }
+
         private static bool IsHostOrSingleplayer()
         {
             try
@@ -385,6 +571,18 @@ namespace FidelityReviveFix
             catch
             {
                 return true;
+            }
+        }
+
+        private static bool IsMultiplayer()
+        {
+            try
+            {
+                return GameManager.Multiplayer();
+            }
+            catch
+            {
+                return false;
             }
         }
 
@@ -449,7 +647,7 @@ namespace FidelityReviveFix
             }
             catch (Exception ex)
             {
-                Plugin.Log.LogWarning(name + " write failed: " + ex.Message);
+                LogException(name + " write", ex);
             }
         }
 
@@ -476,11 +674,52 @@ namespace FidelityReviveFix
                 Plugin.Log.LogInfo(message);
             }
         }
+
+        private static string FormatExpectedPosition(bool hasExpectedPosition, Vector3 expectedPosition)
+        {
+            if (!hasExpectedPosition)
+            {
+                return "unknown";
+            }
+
+            return "(" + expectedPosition.x.ToString("F2") + ", " + expectedPosition.y.ToString("F2") + ", " + expectedPosition.z.ToString("F2") + ")";
+        }
+
+        internal static void LogException(string stage, Exception ex)
+        {
+            if (Plugin.Log == null)
+            {
+                return;
+            }
+
+            Exception report = ex;
+            if (ex is TargetInvocationException && ex.InnerException != null)
+            {
+                report = ex.InnerException;
+            }
+
+            Plugin.Log.LogWarning(stage + " failed: " + report.GetType().Name + ": " + report.Message);
+            if (ModConfig.DebugLogging != null && ModConfig.DebugLogging.Value)
+            {
+                if (report.StackTrace != null)
+                {
+                    Plugin.Log.LogWarning(stage + " stack: " + report.StackTrace);
+                }
+
+                if (!object.ReferenceEquals(report, ex))
+                {
+                    Plugin.Log.LogWarning(stage + " wrapper: " + ex.GetType().Name + ": " + ex.Message);
+                }
+            }
+        }
     }
 
     internal static class ClientReviveProtection
     {
         private const string REPOFidelityGuid = "Vippy.REPOFidelity";
+        private const float PositionRepairDropThreshold = 2f;
+        private const float PositionRepairDistanceThreshold = 12f;
+        private const float PlayerTransformDriftThreshold = 3f;
 
         private static readonly FieldInfo SpectateCameraMainCameraField =
             typeof(SpectateCamera).GetField("MainCamera", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
@@ -503,30 +742,51 @@ namespace FidelityReviveFix
 
         internal static void OnReviveRpc(PlayerAvatar player)
         {
-            if (!ShouldRunFor(player) || Plugin.Instance == null)
+            if (!WouldRunFor(player) || Plugin.Instance == null)
             {
                 return;
             }
 
-            Plugin.Instance.StartProtectionRoutine(player);
+            Plugin.Instance.StartProtectionRoutine(player, false, Vector3.zero, "post revive rpc protection", false);
         }
 
         internal static IEnumerator Run(PlayerAvatar player)
         {
+            return Run(player, false, Vector3.zero, "post revive protection", false);
+        }
+
+        internal static IEnumerator Run(PlayerAvatar player, bool hasExpectedPosition, Vector3 expectedPosition, string reason, bool allowPositionRepair)
+        {
+            if (!WouldRunFor(player))
+            {
+                yield break;
+            }
+
             float endTime = Time.time + ModConfig.SafeProtectionWindow();
-            DebugLog("Starting local post-revive REPOFidelity protection.");
+            DebugLog("Starting local " + reason + ".");
 
             while (Time.time <= endTime)
             {
-                ApplyLocalFixes(player);
+                ApplyLocalFixes(player, hasExpectedPosition, expectedPosition, allowPositionRepair);
                 yield return null;
             }
 
-            ApplyLocalFixes(player);
-            DebugLog("Finished local post-revive REPOFidelity protection.");
+            ApplyLocalFixes(player, hasExpectedPosition, expectedPosition, allowPositionRepair);
+            DebugLog("Finished local " + reason + ".");
         }
 
-        private static bool ShouldRunFor(PlayerAvatar player)
+        internal static void ApplyImmediate(PlayerAvatar player, bool hasExpectedPosition, Vector3 expectedPosition, string reason, bool allowPositionRepair)
+        {
+            if (!WouldRunFor(player))
+            {
+                return;
+            }
+
+            DebugLog(reason + ".");
+            ApplyLocalFixes(player, hasExpectedPosition, expectedPosition, allowPositionRepair);
+        }
+
+        internal static bool WouldRunFor(PlayerAvatar player)
         {
             if (ModConfig.REPOFidelityClientProtection == null ||
                 ModConfig.REPOFidelityClientProtection.Value == ClientProtectionMode.Off ||
@@ -576,7 +836,7 @@ namespace FidelityReviveFix
             }
         }
 
-        private static void ApplyLocalFixes(PlayerAvatar player)
+        private static void ApplyLocalFixes(PlayerAvatar player, bool hasExpectedPosition, Vector3 expectedPosition, bool allowPositionRepair)
         {
             if (player == null)
             {
@@ -598,6 +858,11 @@ namespace FidelityReviveFix
                 SafeCall(player.localCamera.Teleported, "PlayerLocalCamera.Teleported");
             }
 
+            if (allowPositionRepair)
+            {
+                RepairLocalPositionIfNeeded(player, hasExpectedPosition, expectedPosition);
+            }
+
             EnsureObject("CameraZoom.Instance", CameraZoom.Instance);
             EnsureObject("PostProcessing.Instance", PostProcessing.Instance);
             EnsureObject("AudioManager.instance", AudioManager.instance);
@@ -605,6 +870,51 @@ namespace FidelityReviveFix
             if (AudioManager.instance != null)
             {
                 EnsureObject("AudioManager.AudioListener", GetField<AudioListenerFollow>(AudioManagerAudioListenerField, AudioManager.instance));
+            }
+        }
+
+        private static void RepairLocalPositionIfNeeded(PlayerAvatar player, bool hasExpectedPosition, Vector3 expectedPosition)
+        {
+            if (!hasExpectedPosition || player == null || !IsLocalPlayer(player))
+            {
+                return;
+            }
+
+            try
+            {
+                Vector3 avatarPosition = player.transform.position;
+                bool droppedBelowRevive = avatarPosition.y < expectedPosition.y - PositionRepairDropThreshold;
+                bool farFromRevive = Vector3.Distance(avatarPosition, expectedPosition) > PositionRepairDistanceThreshold;
+                bool playerTransformDrift = player.playerTransform != null &&
+                    Vector3.Distance(player.playerTransform.position, avatarPosition) > PlayerTransformDriftThreshold;
+
+                if (!droppedBelowRevive && !farFromRevive && !playerTransformDrift)
+                {
+                    return;
+                }
+
+                player.transform.position = expectedPosition;
+
+                if (player.playerTransform != null)
+                {
+                    player.playerTransform.position = expectedPosition;
+                }
+
+                if (CameraPosition.instance != null)
+                {
+                    CameraPosition.instance.transform.position = expectedPosition;
+                }
+
+                if (player.localCamera != null)
+                {
+                    SafeCall(player.localCamera.Teleported, "PlayerLocalCamera.Teleported after position repair");
+                }
+
+                DebugLog("Repaired local revive position to expected extraction revive point.");
+            }
+            catch (Exception ex)
+            {
+                InstantReviveController.LogException("local revive position repair", ex);
             }
         }
 
@@ -662,14 +972,22 @@ namespace FidelityReviveFix
                 return null;
             }
 
-            return field.GetValue(instance) as T;
+            try
+            {
+                return field.GetValue(instance) as T;
+            }
+            catch (Exception ex)
+            {
+                DebugLog("Field read failed: " + ex.Message);
+                return null;
+            }
         }
 
         private static void EnsureObject(string name, UnityEngine.Object obj)
         {
             if (obj == null)
             {
-                DebugLog(name + " is not ready during post-revive protection.");
+                DebugLog(name + " is not ready during local revive protection.");
             }
         }
 
