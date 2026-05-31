@@ -9,7 +9,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $modName = "FidelityReviveFix"
-$modVersion = "0.1.4"
+$modVersion = "0.1.5"
 $authorName = "AngelcoMilk"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -84,11 +84,34 @@ function Test-GameHookTargets {
     }
 
     Add-Type -Path $CecilPath
-    $assembly = [Mono.Cecil.AssemblyDefinition]::ReadAssembly($AssemblyPath)
+    $assemblyPaths = @(
+        $AssemblyPath,
+        (Join-Path (Split-Path -Parent $AssemblyPath) "PhotonUnityNetworking.dll"),
+        (Join-Path (Split-Path -Parent $AssemblyPath) "PhotonRealtime.dll"),
+        (Join-Path (Split-Path -Parent $AssemblyPath) "Photon3Unity3D.dll")
+    ) | Where-Object { Test-Path $_ }
+
+    $assemblies = @($assemblyPaths | ForEach-Object { [Mono.Cecil.AssemblyDefinition]::ReadAssembly($_) })
+
+    function Find-TypeDefinition {
+        param([string]$TypeName)
+        foreach ($candidateAssembly in $assemblies) {
+            $type = $candidateAssembly.MainModule.Types | Where-Object { $_.Name -eq $TypeName -or $_.FullName -eq $TypeName } | Select-Object -First 1
+            if ($null -ne $type) {
+                return $type
+            }
+        }
+
+        return $null
+    }
+
     $targets = @(
         @{ Type = "PlayerDeathHead"; Method = "Update"; Parameters = @() },
         @{ Type = "PlayerDeathHead"; Method = "Revive"; Parameters = @() },
         @{ Type = "PlayerAvatar"; Method = "ReviveRPC"; Parameters = @("System.Boolean", "Photon.Pun.PhotonMessageInfo") },
+        @{ Type = "Photon.Pun.PhotonNetwork"; Method = "get_LocalPlayer"; Parameters = @() },
+        @{ Type = "Photon.Pun.PhotonNetwork"; Method = "get_PlayerList"; Parameters = @() },
+        @{ Type = "Photon.Realtime.Player"; Method = "SetCustomProperties"; Parameters = @("ExitGames.Client.Photon.Hashtable", "ExitGames.Client.Photon.Hashtable", "Photon.Realtime.WebFlags") },
         @{ Type = "SpectateCamera"; Method = "CheckState"; Parameters = @("SpectateCamera/State") },
         @{ Type = "SpectateCamera"; Method = "StopSpectate"; Parameters = @() },
         @{ Type = "RunManager"; Method = "ChangeLevel"; Parameters = @("System.Boolean", "System.Boolean", "RunManager/ChangeLevelType") }
@@ -121,10 +144,13 @@ function Test-GameHookTargets {
         @{ Type = "SpectateCamera"; Field = "normalTransformPivot" },
         @{ Type = "AudioManager"; Field = "AudioListener" }
     )
+    $requiredProperties = @(
+        @{ Type = "Photon.Realtime.Player"; Property = "CustomProperties" }
+    )
 
     $errors = New-Object System.Collections.Generic.List[string]
     foreach ($target in $targets) {
-        $type = $assembly.MainModule.Types | Where-Object { $_.Name -eq $target.Type -or $_.FullName -eq $target.Type } | Select-Object -First 1
+        $type = Find-TypeDefinition -TypeName $target.Type
         if ($null -eq $type) {
             $errors.Add("Missing type: $($target.Type)")
             continue
@@ -161,7 +187,7 @@ function Test-GameHookTargets {
     }
 
     foreach ($requiredField in $requiredFields) {
-        $type = $assembly.MainModule.Types | Where-Object { $_.Name -eq $requiredField.Type -or $_.FullName -eq $requiredField.Type } | Select-Object -First 1
+        $type = Find-TypeDefinition -TypeName $requiredField.Type
         if ($null -eq $type) {
             $errors.Add("Missing field owner type: $($requiredField.Type)")
             continue
@@ -170,6 +196,19 @@ function Test-GameHookTargets {
         $field = $type.Fields | Where-Object { $_.Name -eq $requiredField.Field } | Select-Object -First 1
         if ($null -eq $field) {
             $errors.Add("Missing field: $($requiredField.Type).$($requiredField.Field)")
+        }
+    }
+
+    foreach ($requiredProperty in $requiredProperties) {
+        $type = Find-TypeDefinition -TypeName $requiredProperty.Type
+        if ($null -eq $type) {
+            $errors.Add("Missing property owner type: $($requiredProperty.Type)")
+            continue
+        }
+
+        $property = $type.Properties | Where-Object { $_.Name -eq $requiredProperty.Property } | Select-Object -First 1
+        if ($null -eq $property) {
+            $errors.Add("Missing property: $($requiredProperty.Type).$($requiredProperty.Property)")
         }
     }
 

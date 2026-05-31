@@ -1,9 +1,9 @@
 {
     "name": "FidelityReviveFix",
-    "version_number": "0.1.4",
+    "version_number": "0.1.5",
     "author": "AngelcoMilk",
     "website_url": "https://github.com/AngelcoMilk/FidelityReviveFix",
-    "description": "Adaptive extraction-point revive for hosts: instant normally, stable delayed when REPOFidelity is loaded to avoid revive conflict bugs.",
+    "description": "Adaptive extraction-point revive for hosts, with multiplayer REPOFidelity timing negotiation to avoid revive conflict bugs.",
     "dependencies": [
         "BepInEx-BepInExPack-5.4.2305"
     ]

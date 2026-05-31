@@ -6,7 +6,10 @@ using BepInEx;
 using BepInEx.Bootstrap;
 using BepInEx.Configuration;
 using BepInEx.Logging;
+using ExitGames.Client.Photon;
 using HarmonyLib;
+using Photon.Pun;
+using Photon.Realtime;
 using UnityEngine;
 
 namespace FidelityReviveFix
@@ -16,12 +19,13 @@ namespace FidelityReviveFix
     {
         public const string PluginGuid = "AngelcoMilk.FidelityReviveFix";
         public const string PluginName = "FidelityReviveFix";
-        public const string PluginVersion = "0.1.4";
+        public const string PluginVersion = "0.1.5";
 
         internal static Plugin Instance;
         internal static ManualLogSource Log;
 
         private Harmony _harmony;
+        private float _nextCapabilityPublishTime;
 
         private void Awake()
         {
@@ -30,6 +34,7 @@ namespace FidelityReviveFix
             ModConfig.Bind(Config);
             InstantReviveController.Reset();
             ClientReviveProtection.Reset();
+            MultiplayerCapabilitySync.PublishLocalCapabilities();
 
             _harmony = new Harmony(PluginGuid);
             _harmony.PatchAll();
@@ -37,10 +42,22 @@ namespace FidelityReviveFix
             Logger.LogInfo(PluginName + " " + PluginVersion + " loaded.");
         }
 
+        private void Update()
+        {
+            if (Time.time < _nextCapabilityPublishTime)
+            {
+                return;
+            }
+
+            _nextCapabilityPublishTime = Time.time + 10f;
+            MultiplayerCapabilitySync.PublishLocalCapabilities();
+        }
+
         private void OnDestroy()
         {
             InstantReviveController.Reset();
             ClientReviveProtection.Reset();
+            MultiplayerCapabilitySync.Clear();
 
             if (_harmony != null)
             {
@@ -84,10 +101,17 @@ namespace FidelityReviveFix
         StableDelayed
     }
 
+    internal enum UnknownClientPolicy
+    {
+        HostLocal,
+        StableDelayed
+    }
+
     internal static class ModConfig
     {
         internal static ConfigEntry<bool> EnableInstantExtractionRevive;
         internal static ConfigEntry<ReviveTimingPolicy> ReviveTimingPolicyEntry;
+        internal static ConfigEntry<UnknownClientPolicy> UnknownClientPolicyEntry;
         internal static ConfigEntry<float> StableDelayedReviveDelay;
         internal static ConfigEntry<bool> EnableFallbackExtractionDetection;
         internal static ConfigEntry<ClientProtectionMode> REPOFidelityClientProtection;
@@ -106,7 +130,13 @@ namespace FidelityReviveFix
                 "Instant Revive",
                 "Revive Timing Policy",
                 ReviveTimingPolicy.Auto,
-                "Auto uses StableDelayed when Vippy.REPOFidelity is loaded and Instant otherwise. Instant revives during PlayerDeathHead.Update. StableDelayed waits briefly for vanilla camera/spectate state before reviving.");
+                "Auto uses the revived player's reported REPOFidelity status in multiplayer, or local REPOFidelity status in singleplayer. Instant revives during PlayerDeathHead.Update. StableDelayed waits briefly for vanilla camera/spectate state before reviving.");
+
+            UnknownClientPolicyEntry = config.Bind(
+                "Instant Revive",
+                "Unknown Client Policy",
+                UnknownClientPolicy.HostLocal,
+                "HostLocal uses the host/local policy when a remote player did not report FidelityReviveFix capabilities. StableDelayed conservatively delays unknown remote players.");
 
             StableDelayedReviveDelay = config.Bind(
                 "Instant Revive",
@@ -162,17 +192,27 @@ namespace FidelityReviveFix
             return ReviveTimingPolicyEntry == null ? ReviveTimingPolicy.Auto : ReviveTimingPolicyEntry.Value;
         }
 
-        internal static ReviveTimingPolicy EffectiveReviveTimingPolicy()
+        internal static UnknownClientPolicy SafeUnknownClientPolicy()
+        {
+            return UnknownClientPolicyEntry == null ? UnknownClientPolicy.HostLocal : UnknownClientPolicyEntry.Value;
+        }
+
+        internal static ReviveTimingPolicy EffectiveReviveTimingPolicy(PlayerAvatar targetPlayer, out string reason)
         {
             ReviveTimingPolicy policy = SafeReviveTimingPolicy();
             if (policy != ReviveTimingPolicy.Auto)
             {
+                reason = "forced=" + policy;
                 return policy;
             }
 
-            return ClientReviveProtection.IsREPOFidelityLoaded()
-                ? ReviveTimingPolicy.StableDelayed
-                : ReviveTimingPolicy.Instant;
+            return MultiplayerCapabilitySync.ResolveReviveTimingFor(targetPlayer, out reason);
+        }
+
+        internal static ReviveTimingPolicy EffectiveReviveTimingPolicy()
+        {
+            string ignored;
+            return EffectiveReviveTimingPolicy(null, out ignored);
         }
     }
 
@@ -186,6 +226,7 @@ namespace FidelityReviveFix
             internal bool ReviveCompleted;
             internal bool WasTriggered;
             internal bool ReviveQueued;
+            internal float FirstInsideTime;
             internal float LastAttemptTime;
             internal float NextDebugLogTime;
         }
@@ -252,6 +293,7 @@ namespace FidelityReviveFix
                 state.ReviveCompleted = false;
                 state.WasTriggered = false;
                 state.ReviveQueued = false;
+                state.FirstInsideTime = 0f;
                 state.LastAttemptTime = 0f;
                 return;
             }
@@ -261,12 +303,18 @@ namespace FidelityReviveFix
                 state.ReviveCompleted = false;
                 state.WasTriggered = true;
                 state.ReviveQueued = false;
+                state.FirstInsideTime = 0f;
                 state.LastAttemptTime = 0f;
             }
 
             if (state.ReviveCompleted || state.ReviveQueued)
             {
                 return;
+            }
+
+            if (state.FirstInsideTime <= 0f)
+            {
+                state.FirstInsideTime = Time.time;
             }
 
             bool roomCheckInside;
@@ -292,11 +340,13 @@ namespace FidelityReviveFix
 
             state.LastAttemptTime = Time.time;
 
-            ReviveTimingPolicy policy = ModConfig.EffectiveReviveTimingPolicy();
+            string policyReason;
+            ReviveTimingPolicy policy = ModConfig.EffectiveReviveTimingPolicy(head.playerAvatar, out policyReason);
+            DebugLogState(state, "Revive timing selected: policy=" + policy + ", reason=" + policyReason + ", target=" + MultiplayerCapabilitySync.DescribePlayer(head.playerAvatar) + ", firstInsideAge=" + (Time.time - state.FirstInsideTime).ToString("F3") + ".");
 
             if (policy == ReviveTimingPolicy.Instant || Plugin.Instance == null)
             {
-                ExecuteReviveAttempt(head, state, roomCheckInside, headInside, fallbackInside, "instant revive", false);
+                ExecuteReviveAttempt(head, state, roomCheckInside, headInside, fallbackInside, "instant revive", false, policy, policyReason);
                 return;
             }
 
@@ -369,12 +419,14 @@ namespace FidelityReviveFix
                     state.ReviveQueued = false;
                 }
 
-                ExecuteReviveAttempt(head, state, roomCheckInside, headInside, fallbackInside, "stable delayed revive", false);
+                string policyReason;
+                ReviveTimingPolicy policy = ModConfig.EffectiveReviveTimingPolicy(head.playerAvatar, out policyReason);
+                ExecuteReviveAttempt(head, state, roomCheckInside, headInside, fallbackInside, "stable delayed revive", false, policy, policyReason);
                 yield break;
             }
         }
 
-        private static void ExecuteReviveAttempt(PlayerDeathHead head, ReviveState state, bool roomCheckInside, bool headInside, bool fallbackInside, string stage, bool requirePreflight)
+        private static void ExecuteReviveAttempt(PlayerDeathHead head, ReviveState state, bool roomCheckInside, bool headInside, bool fallbackInside, string stage, bool requirePreflight, ReviveTimingPolicy policy, string policyReason)
         {
             if (head == null || head.playerAvatar == null)
             {
@@ -395,7 +447,7 @@ namespace FidelityReviveFix
 
             bool hadException;
             bool successObserved;
-            bool completed = TryRevive(head, state, roomCheckInside, headInside, fallbackInside, stage, hasExpectedPosition, expectedPosition, out hadException, out successObserved);
+            bool completed = TryRevive(head, state, roomCheckInside, headInside, fallbackInside, stage, hasExpectedPosition, expectedPosition, policy, policyReason, out hadException, out successObserved);
             if (completed && !hadException && state != null)
             {
                 state.ReviveCompleted = true;
@@ -407,14 +459,15 @@ namespace FidelityReviveFix
             }
         }
 
-        private static bool TryRevive(PlayerDeathHead head, ReviveState state, bool roomCheckInside, bool headInside, bool fallbackInside, string stage, bool hasExpectedPosition, Vector3 expectedPosition, out bool hadException, out bool successObserved)
+        private static bool TryRevive(PlayerDeathHead head, ReviveState state, bool roomCheckInside, bool headInside, bool fallbackInside, string stage, bool hasExpectedPosition, Vector3 expectedPosition, ReviveTimingPolicy policy, string policyReason, out bool hadException, out bool successObserved)
         {
             hadException = false;
             successObserved = false;
 
             try
             {
-                DebugLogState(state, stage + ": revive attempt. effectivePolicy=" + ModConfig.EffectiveReviveTimingPolicy() + ", roomCheck=" + roomCheckInside + ", headFieldBefore=" + headInside + ", fallback=" + fallbackInside + ", expectedPosition=" + FormatExpectedPosition(hasExpectedPosition, expectedPosition) + ", repoFidelityProtection=" + ClientReviveProtection.WouldRunFor(head.playerAvatar) + ".");
+                float firstInsideAge = state == null || state.FirstInsideTime <= 0f ? 0f : Time.time - state.FirstInsideTime;
+                DebugLogState(state, stage + ": revive attempt. effectivePolicy=" + policy + ", policyReason=" + policyReason + ", target=" + MultiplayerCapabilitySync.DescribePlayer(head.playerAvatar) + ", firstInsideAge=" + firstInsideAge.ToString("F3") + ", roomCheck=" + roomCheckInside + ", headFieldBefore=" + headInside + ", fallback=" + fallbackInside + ", expectedPosition=" + FormatExpectedPosition(hasExpectedPosition, expectedPosition) + ", repoFidelityProtection=" + ClientReviveProtection.WouldRunFor(head.playerAvatar) + ".");
                 head.Revive();
                 successObserved = HasReviveClearlySucceeded(head);
                 bool multiplayer = IsMultiplayer();
@@ -842,7 +895,7 @@ namespace FidelityReviveFix
 
     internal static class ClientReviveProtection
     {
-        private const string REPOFidelityGuid = "Vippy.REPOFidelity";
+        internal const string REPOFidelityGuid = "Vippy.REPOFidelity";
         private static readonly FieldInfo SpectateCameraMainCameraField =
             typeof(SpectateCamera).GetField("MainCamera", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
@@ -1022,6 +1075,196 @@ namespace FidelityReviveFix
             {
                 DebugLog(name + " is not ready during local revive protection.");
             }
+        }
+
+        private static void DebugLog(string message)
+        {
+            if (ModConfig.DebugLogging != null && ModConfig.DebugLogging.Value)
+            {
+                Plugin.Log.LogInfo(message);
+            }
+        }
+    }
+
+    internal static class MultiplayerCapabilitySync
+    {
+        private const byte HasModKey = 201;
+        private const byte ModVersionKey = 202;
+        private const byte HasREPOFidelityKey = 203;
+
+        internal static void Clear()
+        {
+        }
+
+        internal static void PublishLocalCapabilities()
+        {
+            try
+            {
+                if (!GameManager.Multiplayer() || PhotonNetwork.LocalPlayer == null)
+                {
+                    return;
+                }
+
+                ExitGames.Client.Photon.Hashtable properties = new ExitGames.Client.Photon.Hashtable();
+                properties[HasModKey] = true;
+                properties[ModVersionKey] = Plugin.PluginVersion;
+                properties[HasREPOFidelityKey] = ClientReviveProtection.IsREPOFidelityLoaded();
+                PhotonNetwork.LocalPlayer.SetCustomProperties(properties, null, null);
+                DebugLog("Published multiplayer capabilities: hasMod=True, version=" + Plugin.PluginVersion + ", hasREPOFidelity=" + ClientReviveProtection.IsREPOFidelityLoaded() + ".");
+            }
+            catch (Exception ex)
+            {
+                DebugLog("Publish multiplayer capabilities failed: " + ex.Message);
+            }
+        }
+
+        internal static ReviveTimingPolicy ResolveReviveTimingFor(PlayerAvatar targetPlayer, out string reason)
+        {
+            Player photonPlayer = GetPhotonPlayer(targetPlayer);
+            if (photonPlayer == null)
+            {
+                ReviveTimingPolicy localPolicy = LocalPolicy();
+                reason = "noPhotonPlayer; localPolicy=" + localPolicy + ", localRepoFidelity=" + ClientReviveProtection.IsREPOFidelityLoaded();
+                return localPolicy;
+            }
+
+            bool hasMod;
+            bool hasModKnown = TryGetBool(photonPlayer, HasModKey, out hasMod);
+            bool hasREPOFidelity;
+            bool hasREPOFidelityKnown = TryGetBool(photonPlayer, HasREPOFidelityKey, out hasREPOFidelity);
+            string version = GetString(photonPlayer, ModVersionKey);
+
+            if (hasREPOFidelityKnown && hasREPOFidelity)
+            {
+                reason = "targetRepoFidelity=True, targetHasMod=" + FormatKnownBool(hasModKnown, hasMod) + ", targetVersion=" + FormatString(version);
+                return ReviveTimingPolicy.StableDelayed;
+            }
+
+            if (hasREPOFidelityKnown && !hasREPOFidelity)
+            {
+                reason = "targetRepoFidelity=False, targetHasMod=" + FormatKnownBool(hasModKnown, hasMod) + ", targetVersion=" + FormatString(version);
+                return ReviveTimingPolicy.Instant;
+            }
+
+            if (photonPlayer.IsLocal)
+            {
+                ReviveTimingPolicy localPolicy = LocalPolicy();
+                reason = "targetLocalNoReport; localPolicy=" + localPolicy + ", localRepoFidelity=" + ClientReviveProtection.IsREPOFidelityLoaded();
+                return localPolicy;
+            }
+
+            if (ModConfig.SafeUnknownClientPolicy() == UnknownClientPolicy.StableDelayed)
+            {
+                reason = "targetReportUnknown; unknownClientPolicy=StableDelayed, targetHasMod=" + FormatKnownBool(hasModKnown, hasMod) + ", targetVersion=" + FormatString(version);
+                return ReviveTimingPolicy.StableDelayed;
+            }
+
+            ReviveTimingPolicy hostPolicy = LocalPolicy();
+            reason = "targetReportUnknown; unknownClientPolicy=HostLocal, hostPolicy=" + hostPolicy + ", targetHasMod=" + FormatKnownBool(hasModKnown, hasMod) + ", targetVersion=" + FormatString(version);
+            return hostPolicy;
+        }
+
+        internal static string DescribePlayer(PlayerAvatar targetPlayer)
+        {
+            Player photonPlayer = GetPhotonPlayer(targetPlayer);
+            if (photonPlayer == null)
+            {
+                return "unknown";
+            }
+
+            return "actor=" + photonPlayer.ActorNumber + ", nick=" + FormatString(photonPlayer.NickName);
+        }
+
+        private static ReviveTimingPolicy LocalPolicy()
+        {
+            return ClientReviveProtection.IsREPOFidelityLoaded()
+                ? ReviveTimingPolicy.StableDelayed
+                : ReviveTimingPolicy.Instant;
+        }
+
+        private static Player GetPhotonPlayer(PlayerAvatar targetPlayer)
+        {
+            try
+            {
+                if (!GameManager.Multiplayer())
+                {
+                    return PhotonNetwork.LocalPlayer;
+                }
+
+                if (targetPlayer == null)
+                {
+                    return PhotonNetwork.LocalPlayer;
+                }
+
+                if (targetPlayer.photonView != null && targetPlayer.photonView.Owner != null)
+                {
+                    return targetPlayer.photonView.Owner;
+                }
+
+                if (targetPlayer == PlayerAvatar.instance)
+                {
+                    return PhotonNetwork.LocalPlayer;
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLog("Resolve target Photon player failed: " + ex.Message);
+            }
+
+            return null;
+        }
+
+        private static bool TryGetBool(Player player, byte key, out bool value)
+        {
+            value = false;
+            try
+            {
+                if (player == null || player.CustomProperties == null || !player.CustomProperties.ContainsKey(key))
+                {
+                    return false;
+                }
+
+                object raw = player.CustomProperties[key];
+                if (raw is bool)
+                {
+                    value = (bool)raw;
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLog("Read multiplayer capability bool failed: " + ex.Message);
+            }
+
+            return false;
+        }
+
+        private static string GetString(Player player, byte key)
+        {
+            try
+            {
+                if (player == null || player.CustomProperties == null || !player.CustomProperties.ContainsKey(key))
+                {
+                    return null;
+                }
+
+                return player.CustomProperties[key] as string;
+            }
+            catch (Exception ex)
+            {
+                DebugLog("Read multiplayer capability string failed: " + ex.Message);
+                return null;
+            }
+        }
+
+        private static string FormatKnownBool(bool known, bool value)
+        {
+            return known ? value.ToString() : "unknown";
+        }
+
+        private static string FormatString(string value)
+        {
+            return string.IsNullOrEmpty(value) ? "unknown" : value;
         }
 
         private static void DebugLog(string message)
@@ -1234,6 +1477,7 @@ namespace FidelityReviveFix
         {
             InstantReviveController.Reset();
             ClientReviveProtection.Reset();
+            MultiplayerCapabilitySync.PublishLocalCapabilities();
         }
     }
 }

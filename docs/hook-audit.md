@@ -4,7 +4,7 @@ Validation date: 2026-05-31
 
 Game assembly checked: `D:\SteamLibrary\steamapps\common\REPO\REPO_Data\Managed\Assembly-CSharp.dll`
 
-Version audited: `0.1.4`
+Version audited: `0.1.5`
 
 ## Harmony Targets
 
@@ -13,8 +13,15 @@ Version audited: `0.1.4`
 - Patch: Postfix.
 - Purpose: host/singleplayer extraction-point revive detection and adaptive revive timing.
 - Boundary: only runs the revive decision when `SemiFunc.IsMasterClientOrSingleplayer()` returns true and `Enable Instant Extraction Revive` is enabled.
-- Failure downgrade: if extraction detection or vanilla revive no-ops, the mod keeps retrying on a short throttle instead of locking the death head permanently. `Revive Timing Policy = Auto` uses `Instant` when REPOFidelity is absent and `StableDelayed` when `Vippy.REPOFidelity` is loaded.
+- Failure downgrade: if extraction detection or vanilla revive no-ops, the mod keeps retrying on a short throttle instead of locking the death head permanently. `Revive Timing Policy = Auto` uses the target player's reported REPOFidelity state in multiplayer and local state in singleplayer.
 - Safety note: default revive detection now follows vanilla `RoomVolumeCheck.inExtractionPoint` or `PlayerDeathHead.inExtractionPoint`. The independent fallback scan is a diagnostic compatibility option and is disabled by default.
+
+### Photon player properties
+
+- Patch: no Harmony patch; written from plugin load/update and level-change housekeeping.
+- Purpose: publish local FidelityReviveFix capability, plugin version, and local `Vippy.REPOFidelity` detection through `PhotonNetwork.LocalPlayer.SetCustomProperties`.
+- Boundary: capability metadata only. The mod still uses vanilla `PlayerAvatar.ReviveRPC` for revive sync and does not add a custom revive RPC.
+- Failure downgrade: if Photon local player or custom properties are unavailable, publish is skipped and the host falls back to `Unknown Client Policy`.
 
 ### `PlayerDeathHead.Revive()`
 
@@ -67,3 +74,7 @@ Build validation verifies these fields before compiling:
 - `SpectateCamera.PreviousParent`
 - `SpectateCamera.normalTransformPivot`
 - `AudioManager.AudioListener`
+- `PhotonNetwork.LocalPlayer`
+- `PhotonNetwork.PlayerList`
+- `Photon.Realtime.Player.CustomProperties`
+- `Photon.Realtime.Player.SetCustomProperties`
