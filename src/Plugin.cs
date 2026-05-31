@@ -16,7 +16,7 @@ namespace FidelityReviveFix
     {
         public const string PluginGuid = "AngelcoMilk.FidelityReviveFix";
         public const string PluginName = "FidelityReviveFix";
-        public const string PluginVersion = "0.1.0";
+        public const string PluginVersion = "0.1.1";
 
         internal static Plugin Instance;
         internal static ManualLogSource Log;
@@ -113,10 +113,15 @@ namespace FidelityReviveFix
 
     internal static class InstantReviveController
     {
+        private const float RetryIntervalSeconds = 0.12f;
+        private const float DebugLogIntervalSeconds = 0.75f;
+
         private sealed class ReviveState
         {
-            internal bool ReviveIssued;
+            internal bool ReviveCompleted;
             internal bool WasTriggered;
+            internal float LastAttemptTime;
+            internal float NextDebugLogTime;
         }
 
         private static readonly Dictionary<int, ReviveState> States = new Dictionary<int, ReviveState>();
@@ -127,6 +132,15 @@ namespace FidelityReviveFix
 
         private static readonly FieldInfo PlayerDeathHeadRoomVolumeCheckField =
             typeof(PlayerDeathHead).GetField("roomVolumeCheck", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        private static readonly FieldInfo PlayerDeathHeadInExtractionPointField =
+            typeof(PlayerDeathHead).GetField("inExtractionPoint", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        private static readonly FieldInfo PlayerAvatarDeadSetField =
+            typeof(PlayerAvatar).GetField("deadSet", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        private static readonly FieldInfo PlayerAvatarIsDisabledField =
+            typeof(PlayerAvatar).GetField("isDisabled", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
         private static readonly FieldInfo RoomVolumeCheckInExtractionPointField =
             typeof(RoomVolumeCheck).GetField("inExtractionPoint", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
@@ -160,35 +174,61 @@ namespace FidelityReviveFix
             bool triggered = IsTriggered(head);
             if (!triggered)
             {
-                state.ReviveIssued = false;
+                state.ReviveCompleted = false;
                 state.WasTriggered = false;
+                state.LastAttemptTime = 0f;
                 return;
             }
 
             if (!state.WasTriggered)
             {
-                state.ReviveIssued = false;
+                state.ReviveCompleted = false;
                 state.WasTriggered = true;
+                state.LastAttemptTime = 0f;
             }
 
-            if (state.ReviveIssued || !IsInsideExtractionPoint(head))
+            if (state.ReviveCompleted)
             {
                 return;
             }
 
-            if (TryRevive(head))
+            bool roomCheckInside;
+            bool headInside;
+            bool fallbackInside;
+            bool inside = IsInsideExtractionPoint(head, out roomCheckInside, out headInside, out fallbackInside);
+
+            if (!inside)
             {
-                state.ReviveIssued = true;
+                DebugLogState(state, "Revive scan: host=True, triggered=True, roomCheck=" + roomCheckInside + ", headField=" + headInside + ", fallback=" + fallbackInside + ", inside=False.");
+                return;
+            }
+
+            if (state.LastAttemptTime > 0f && Time.time - state.LastAttemptTime < RetryIntervalSeconds)
+            {
+                return;
+            }
+
+            if (state.LastAttemptTime <= 0f)
+            {
+                state.NextDebugLogTime = 0f;
+            }
+
+            state.LastAttemptTime = Time.time;
+            if (TryRevive(head, state, roomCheckInside, headInside, fallbackInside))
+            {
+                state.ReviveCompleted = true;
             }
         }
 
-        private static bool TryRevive(PlayerDeathHead head)
+        private static bool TryRevive(PlayerDeathHead head, ReviveState state, bool roomCheckInside, bool headInside, bool fallbackInside)
         {
             try
             {
-                DebugLog("Instant extraction revive triggered.");
+                SetBool(PlayerDeathHeadInExtractionPointField, head, true, "PlayerDeathHead.inExtractionPoint");
                 head.Revive();
-                return true;
+                bool succeeded = HasReviveClearlySucceeded(head);
+                DebugLogState(state, "Instant extraction revive attempt. roomCheck=" + roomCheckInside + ", headFieldBefore=" + headInside + ", fallback=" + fallbackInside + ", headFieldAfter=" + GetBool(PlayerDeathHeadInExtractionPointField, head, false, "PlayerDeathHead.inExtractionPoint") + ", triggeredAfter=" + IsTriggered(head) + ", playerDeadSet=" + GetPlayerBool(head, PlayerAvatarDeadSetField, "PlayerAvatar.deadSet") + ", playerIsDisabled=" + GetPlayerBool(head, PlayerAvatarIsDisabledField, "PlayerAvatar.isDisabled") + ", successObserved=" + succeeded + ".");
+                return succeeded;
             }
             catch (Exception ex)
             {
@@ -199,31 +239,69 @@ namespace FidelityReviveFix
 
         private static bool IsTriggered(PlayerDeathHead head)
         {
-            if (head == null || PlayerDeathHeadTriggeredField == null)
-            {
-                return false;
-            }
-
-            object value = PlayerDeathHeadTriggeredField.GetValue(head);
-            return value is bool && (bool)value;
+            return GetBool(PlayerDeathHeadTriggeredField, head, false, "PlayerDeathHead.triggered");
         }
 
-        private static bool IsInsideExtractionPoint(PlayerDeathHead head)
+        private static bool IsInsideExtractionPoint(PlayerDeathHead head, out bool roomCheckInside, out bool headInside, out bool fallbackInside)
         {
-            RoomVolumeCheck check = PlayerDeathHeadRoomVolumeCheckField == null
-                ? null
-                : PlayerDeathHeadRoomVolumeCheckField.GetValue(head) as RoomVolumeCheck;
+            roomCheckInside = false;
+            headInside = GetBool(PlayerDeathHeadInExtractionPointField, head, false, "PlayerDeathHead.inExtractionPoint");
+            fallbackInside = false;
+
+            RoomVolumeCheck check = GetRoomVolumeCheck(head);
 
             if (check != null && RoomVolumeCheckInExtractionPointField != null)
             {
-                object value = RoomVolumeCheckInExtractionPointField.GetValue(check);
-                if (value is bool && (bool)value)
+                roomCheckInside = GetBool(RoomVolumeCheckInExtractionPointField, check, false, "RoomVolumeCheck.inExtractionPoint");
+                if (roomCheckInside)
                 {
                     return true;
                 }
             }
 
-            return IsIndependentlyInsideExtractionPoint(head, check);
+            fallbackInside = IsIndependentlyInsideExtractionPoint(head, check);
+            return headInside || fallbackInside;
+        }
+
+        private static bool HasReviveClearlySucceeded(PlayerDeathHead head)
+        {
+            if (head == null)
+            {
+                return true;
+            }
+
+            if (!IsTriggered(head))
+            {
+                return true;
+            }
+
+            PlayerAvatar player = head.playerAvatar;
+            if (player == null)
+            {
+                return false;
+            }
+
+            bool deadSet = GetBool(PlayerAvatarDeadSetField, player, true, "PlayerAvatar.deadSet");
+            bool isDisabled = GetBool(PlayerAvatarIsDisabledField, player, true, "PlayerAvatar.isDisabled");
+            return !deadSet && !isDisabled;
+        }
+
+        private static RoomVolumeCheck GetRoomVolumeCheck(PlayerDeathHead head)
+        {
+            if (PlayerDeathHeadRoomVolumeCheckField == null || head == null)
+            {
+                return null;
+            }
+
+            try
+            {
+                return PlayerDeathHeadRoomVolumeCheckField.GetValue(head) as RoomVolumeCheck;
+            }
+            catch (Exception ex)
+            {
+                DebugLog("PlayerDeathHead.roomVolumeCheck read failed: " + ex.Message);
+                return null;
+            }
         }
 
         private static bool IsIndependentlyInsideExtractionPoint(PlayerDeathHead head, RoomVolumeCheck check)
@@ -308,6 +386,87 @@ namespace FidelityReviveFix
             {
                 return true;
             }
+        }
+
+        private static bool GetBool(FieldInfo field, object instance, bool defaultValue, string name)
+        {
+            if (field == null || instance == null)
+            {
+                return defaultValue;
+            }
+
+            try
+            {
+                object value = field.GetValue(instance);
+                if (value is bool)
+                {
+                    return (bool)value;
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLog(name + " read failed: " + ex.Message);
+            }
+
+            return defaultValue;
+        }
+
+        private static string GetPlayerBool(PlayerDeathHead head, FieldInfo field, string name)
+        {
+            PlayerAvatar player = head == null ? null : head.playerAvatar;
+            if (field == null || player == null)
+            {
+                return "unknown";
+            }
+
+            try
+            {
+                object value = field.GetValue(player);
+                if (value is bool)
+                {
+                    return ((bool)value).ToString();
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLog(name + " read failed: " + ex.Message);
+            }
+
+            return "unknown";
+        }
+
+        private static void SetBool(FieldInfo field, object instance, bool value, string name)
+        {
+            if (field == null || instance == null)
+            {
+                DebugLog(name + " is not available; vanilla Revive may no-op if the game field is still false.");
+                return;
+            }
+
+            try
+            {
+                field.SetValue(instance, value);
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning(name + " write failed: " + ex.Message);
+            }
+        }
+
+        private static void DebugLogState(ReviveState state, string message)
+        {
+            if (ModConfig.DebugLogging == null || !ModConfig.DebugLogging.Value || state == null)
+            {
+                return;
+            }
+
+            if (Time.time < state.NextDebugLogTime)
+            {
+                return;
+            }
+
+            state.NextDebugLogTime = Time.time + DebugLogIntervalSeconds;
+            Plugin.Log.LogInfo(message);
         }
 
         private static void DebugLog(string message)

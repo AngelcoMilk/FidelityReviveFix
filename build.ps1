@@ -9,7 +9,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 $modName = "FidelityReviveFix"
-$modVersion = "0.1.0"
+$modVersion = "0.1.1"
+$authorName = "AngelcoMilk"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $src = Join-Path $root "src"
@@ -95,6 +96,9 @@ function Test-GameHookTargets {
     $requiredFields = @(
         @{ Type = "PlayerDeathHead"; Field = "triggered" },
         @{ Type = "PlayerDeathHead"; Field = "roomVolumeCheck" },
+        @{ Type = "PlayerDeathHead"; Field = "inExtractionPoint" },
+        @{ Type = "PlayerAvatar"; Field = "deadSet" },
+        @{ Type = "PlayerAvatar"; Field = "isDisabled" },
         @{ Type = "RoomVolumeCheck"; Field = "inExtractionPoint" },
         @{ Type = "RoomVolumeCheck"; Field = "Mask" },
         @{ Type = "RoomVolumeCheck"; Field = "CheckPosition" },
@@ -125,8 +129,18 @@ function Test-GameHookTargets {
         $hasCompatibleSignature = $false
         foreach ($method in $methods) {
             if ($method.Parameters.Count -eq $expectedParameters.Count) {
-                $hasCompatibleSignature = $true
-                break
+                $parametersMatch = $true
+                for ($i = 0; $i -lt $expectedParameters.Count; $i++) {
+                    if ($method.Parameters[$i].ParameterType.FullName -ne $expectedParameters[$i]) {
+                        $parametersMatch = $false
+                        break
+                    }
+                }
+
+                if ($parametersMatch) {
+                    $hasCompatibleSignature = $true
+                    break
+                }
             }
         }
 
@@ -166,8 +180,19 @@ Copy-Item -LiteralPath (Join-Path $packageSource "manifest.json") -Destination (
 Copy-Item -LiteralPath (Join-Path $packageSource "README.md") -Destination (Join-Path $distRoot "README.md") -Force
 Copy-Item -LiteralPath (Join-Path $packageSource "icon.png") -Destination (Join-Path $distRoot "icon.png") -Force
 
-$profilePluginDir = Join-Path $R2Profile "BepInEx\plugins\$modName"
 if ($InstallToProfile -and (Test-Path (Join-Path $R2Profile "BepInEx"))) {
+    $profilePluginsRoot = Join-Path $R2Profile "BepInEx\plugins"
+    $r2PackageRoot = Join-Path $profilePluginsRoot "$authorName-$modName"
+    $r2PackagePluginDir = Join-Path $r2PackageRoot $modName
+    $profilePluginDir = Join-Path $profilePluginsRoot $modName
+
+    if (Test-Path $r2PackagePluginDir) {
+        $profilePluginDir = $r2PackagePluginDir
+        Copy-Item -LiteralPath (Join-Path $packageSource "manifest.json") -Destination (Join-Path $r2PackageRoot "manifest.json") -Force
+        Copy-Item -LiteralPath (Join-Path $packageSource "README.md") -Destination (Join-Path $r2PackageRoot "README.md") -Force
+        Copy-Item -LiteralPath (Join-Path $packageSource "icon.png") -Destination (Join-Path $r2PackageRoot "icon.png") -Force
+    }
+
     New-Item -ItemType Directory -Force -Path $profilePluginDir | Out-Null
     Copy-Item -LiteralPath $pluginOut -Destination (Join-Path $profilePluginDir "$modName.dll") -Force
     Write-Host "Installed to $profilePluginDir"
