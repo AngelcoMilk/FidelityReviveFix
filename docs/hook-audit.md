@@ -4,29 +4,31 @@ Validation date: 2026-05-31
 
 Game assembly checked: `D:\SteamLibrary\steamapps\common\REPO\REPO_Data\Managed\Assembly-CSharp.dll`
 
-Version audited: `0.1.2`
+Version audited: `0.1.4`
 
 ## Harmony Targets
 
 ### `PlayerDeathHead.Update()`
 
 - Patch: Postfix.
-- Purpose: host/singleplayer instant revive detection and safe revive queueing.
+- Purpose: host/singleplayer extraction-point revive detection and adaptive revive timing.
 - Boundary: only runs the revive decision when `SemiFunc.IsMasterClientOrSingleplayer()` returns true and `Enable Instant Extraction Revive` is enabled.
-- Failure downgrade: if extraction detection or vanilla revive no-ops, the mod keeps retrying on a short throttle instead of locking the death head permanently. `SafeInstant` mode queues one coroutine per death head and waits until end-of-frame plus one fixed update before calling vanilla revive.
+- Failure downgrade: if extraction detection or vanilla revive no-ops, the mod keeps retrying on a short throttle instead of locking the death head permanently. `Revive Timing Policy = Auto` uses `Instant` when REPOFidelity is absent and `StableDelayed` when `Vippy.REPOFidelity` is loaded.
+- Safety note: default revive detection now follows vanilla `RoomVolumeCheck.inExtractionPoint` or `PlayerDeathHead.inExtractionPoint`. The independent fallback scan is a diagnostic compatibility option and is disabled by default.
 
 ### `PlayerDeathHead.Revive()`
 
 - Patch: no Harmony patch; called through the vanilla method.
 - Required vanilla state: `triggered == true`, `inExtractionPoint == true`, and `playerAvatar != null`.
-- Compatibility note: before calling it, FidelityReviveFix writes `PlayerDeathHead.inExtractionPoint = true` and `RoomVolumeCheck.inExtractionPoint = true` when its RoomVolumeCheck or fallback extraction detection says the death head is inside the extraction point.
+- Compatibility note: before calling it, FidelityReviveFix only writes `PlayerDeathHead.inExtractionPoint = true` and `RoomVolumeCheck.inExtractionPoint = true` after vanilla extraction state or the explicitly enabled guarded fallback says the death head is inside the extraction point.
 
 ### `PlayerAvatar.ReviveRPC(bool, Photon.Pun.PhotonMessageInfo)`
 
-- Patch: Postfix.
-- Purpose: start the local REPOFidelity revive-protection window after the vanilla revive RPC is accepted.
+- Patch: Prefix + Postfix.
+- Purpose: Prefix logs read-only dependency readiness before vanilla revive runs; Postfix starts the local non-destructive REPOFidelity revive-protection window after the vanilla revive RPC returns.
 - Boundary: client-side only, local player only. It does not add a custom network protocol and does not attempt to remotely repair unmodded clients.
-- Failure downgrade: if REPOFidelity is absent and protection mode is `Auto`, no local protection work runs. In `0.1.2`, the same local protection can also run before a queued revive, after a failed revive attempt, and after the next frame even if the Postfix path did not run.
+- Failure downgrade: if REPOFidelity is absent and protection mode is `Auto`, no local protection work runs. Local protection is not run before vanilla `ReviveRPC`, and failed revive attempts do not trigger position repair.
+- Safety note: FidelityReviveFix must not call `SpectateCamera.StopSpectate()` from its own protection path. Vanilla `PlayerAvatar.ReviveRPC` calls it during the local revive path, and calling it again can leave `SpectateCamera.instance` unavailable for the next death.
 
 ### `RunManager.ChangeLevel(bool, bool, RunManager.ChangeLevelType)`
 
@@ -43,10 +45,17 @@ Build validation verifies these fields before compiling:
 - `PlayerDeathHead.roomVolumeCheck`
 - `PlayerDeathHead.inExtractionPoint`
 - `PlayerDeathHead.physGrabObject`
+- `PlayerAvatar.playerDeathHead`
 - `PlayerAvatar.deadSet`
 - `PlayerAvatar.isDisabled`
 - `PlayerAvatar.playerTransform`
+- `PlayerAvatar.playerAvatarVisuals`
+- `PlayerAvatar.playerDeathEffects`
+- `PlayerAvatar.playerReviveEffects`
+- `PlayerAvatar.playerAvatarCollision`
+- `PlayerAvatar.RoomVolumeCheck`
 - `PhysGrabObject.centerPoint`
+- `CameraAim.Instance`
 - `CameraPosition.instance`
 - `RoomVolumeCheck.inExtractionPoint`
 - `RoomVolumeCheck.Mask`

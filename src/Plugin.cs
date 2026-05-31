@@ -16,7 +16,7 @@ namespace FidelityReviveFix
     {
         public const string PluginGuid = "AngelcoMilk.FidelityReviveFix";
         public const string PluginName = "FidelityReviveFix";
-        public const string PluginVersion = "0.1.2";
+        public const string PluginVersion = "0.1.4";
 
         internal static Plugin Instance;
         internal static ManualLogSource Log;
@@ -64,9 +64,9 @@ namespace FidelityReviveFix
             return StartCoroutine(ClientReviveProtection.Run(player));
         }
 
-        internal Coroutine StartProtectionRoutine(PlayerAvatar player, bool hasExpectedPosition, Vector3 expectedPosition, string reason, bool allowPositionRepair)
+        internal Coroutine StartProtectionRoutine(PlayerAvatar player, bool hasExpectedPosition, Vector3 expectedPosition, string reason)
         {
-            return StartCoroutine(ClientReviveProtection.Run(player, hasExpectedPosition, expectedPosition, reason, allowPositionRepair));
+            return StartCoroutine(ClientReviveProtection.Run(player, hasExpectedPosition, expectedPosition, reason));
         }
     }
 
@@ -77,16 +77,19 @@ namespace FidelityReviveFix
         Off
     }
 
-    internal enum ReviveTimingMode
+    internal enum ReviveTimingPolicy
     {
-        SafeInstant,
-        SameFrame
+        Auto,
+        Instant,
+        StableDelayed
     }
 
     internal static class ModConfig
     {
         internal static ConfigEntry<bool> EnableInstantExtractionRevive;
-        internal static ConfigEntry<ReviveTimingMode> ReviveTimingModeEntry;
+        internal static ConfigEntry<ReviveTimingPolicy> ReviveTimingPolicyEntry;
+        internal static ConfigEntry<float> StableDelayedReviveDelay;
+        internal static ConfigEntry<bool> EnableFallbackExtractionDetection;
         internal static ConfigEntry<ClientProtectionMode> REPOFidelityClientProtection;
         internal static ConfigEntry<float> PostReviveProtectionWindow;
         internal static ConfigEntry<bool> DebugLogging;
@@ -99,11 +102,25 @@ namespace FidelityReviveFix
                 true,
                 "Host/singleplayer only. When a triggered death head enters an extraction point, immediately triggers the vanilla revive.");
 
-            ReviveTimingModeEntry = config.Bind(
+            ReviveTimingPolicyEntry = config.Bind(
                 "Instant Revive",
-                "Revive Timing Mode",
-                ReviveTimingMode.SafeInstant,
-                "SafeInstant queues the revive until the end of the current frame and one physics tick. SameFrame calls revive during PlayerDeathHead.Update like older instant revive mods.");
+                "Revive Timing Policy",
+                ReviveTimingPolicy.Auto,
+                "Auto uses StableDelayed when Vippy.REPOFidelity is loaded and Instant otherwise. Instant revives during PlayerDeathHead.Update. StableDelayed waits briefly for vanilla camera/spectate state before reviving.");
+
+            StableDelayedReviveDelay = config.Bind(
+                "Instant Revive",
+                "Stable Delayed Revive Delay",
+                0.75f,
+                new ConfigDescription(
+                    "Seconds to wait before automatic revive when StableDelayed timing is active.",
+                    new AcceptableValueRange<float>(0.1f, 3.0f)));
+
+            EnableFallbackExtractionDetection = config.Bind(
+                "Instant Revive",
+                "Enable Fallback Extraction Detection",
+                false,
+                "Diagnostic compatibility fallback. Disabled by default so revive follows vanilla extraction point state. When enabled, an extra extraction-volume scan is allowed only near known extraction points.");
 
             REPOFidelityClientProtection = config.Bind(
                 "REPOFidelity Compatibility",
@@ -116,7 +133,7 @@ namespace FidelityReviveFix
                 "Post Revive Protection Window",
                 0.75f,
                 new ConfigDescription(
-                    "Seconds to keep refreshing local camera/spectate/position state around the vanilla revive. This does not add a visible revive delay.",
+                    "Seconds to keep refreshing non-destructive local camera/audio/post-processing state after vanilla ReviveRPC returns.",
                     new AcceptableValueRange<float>(0.1f, 3.0f)));
 
             DebugLogging = config.Bind(
@@ -133,9 +150,29 @@ namespace FidelityReviveFix
                 : Mathf.Clamp(PostReviveProtectionWindow.Value, 0.1f, 3.0f);
         }
 
-        internal static ReviveTimingMode SafeReviveTimingMode()
+        internal static float SafeStableDelayedReviveDelay()
         {
-            return ReviveTimingModeEntry == null ? ReviveTimingMode.SafeInstant : ReviveTimingModeEntry.Value;
+            return StableDelayedReviveDelay == null
+                ? 0.75f
+                : Mathf.Clamp(StableDelayedReviveDelay.Value, 0.1f, 3.0f);
+        }
+
+        internal static ReviveTimingPolicy SafeReviveTimingPolicy()
+        {
+            return ReviveTimingPolicyEntry == null ? ReviveTimingPolicy.Auto : ReviveTimingPolicyEntry.Value;
+        }
+
+        internal static ReviveTimingPolicy EffectiveReviveTimingPolicy()
+        {
+            ReviveTimingPolicy policy = SafeReviveTimingPolicy();
+            if (policy != ReviveTimingPolicy.Auto)
+            {
+                return policy;
+            }
+
+            return ClientReviveProtection.IsREPOFidelityLoaded()
+                ? ReviveTimingPolicy.StableDelayed
+                : ReviveTimingPolicy.Instant;
         }
     }
 
@@ -179,6 +216,12 @@ namespace FidelityReviveFix
 
         private static readonly FieldInfo RoomVolumeCheckMaskField =
             typeof(RoomVolumeCheck).GetField("Mask", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        private static readonly FieldInfo RoundDirectorExtractionPointCurrentField =
+            typeof(RoundDirector).GetField("extractionPointCurrent", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        private static readonly FieldInfo RoundDirectorExtractionPointListField =
+            typeof(RoundDirector).GetField("extractionPointList", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
         internal static void Reset()
         {
@@ -249,60 +292,89 @@ namespace FidelityReviveFix
 
             state.LastAttemptTime = Time.time;
 
-            if (ModConfig.SafeReviveTimingMode() == ReviveTimingMode.SameFrame || Plugin.Instance == null)
+            ReviveTimingPolicy policy = ModConfig.EffectiveReviveTimingPolicy();
+
+            if (policy == ReviveTimingPolicy.Instant || Plugin.Instance == null)
             {
-                ExecuteReviveAttempt(head, state, roomCheckInside, headInside, fallbackInside, "same frame revive");
+                ExecuteReviveAttempt(head, state, roomCheckInside, headInside, fallbackInside, "instant revive", false);
                 return;
             }
 
             state.ReviveQueued = true;
-            DebugLogState(state, "queued safe instant revive. roomCheck=" + roomCheckInside + ", headField=" + headInside + ", fallback=" + fallbackInside + ".");
+            DebugLogState(state, "queued stable delayed revive. policy=" + policy + ", repoFidelityLoaded=" + ClientReviveProtection.IsREPOFidelityLoaded() + ", delay=" + ModConfig.SafeStableDelayedReviveDelay().ToString("F2") + ", roomCheck=" + roomCheckInside + ", headField=" + headInside + ", fallback=" + fallbackInside + ".");
             try
             {
-                Plugin.Instance.StartReviveRoutine(RunSafeInstantRevive(head, state));
+                Plugin.Instance.StartReviveRoutine(RunStableDelayedRevive(head, state));
             }
             catch (Exception ex)
             {
                 state.ReviveQueued = false;
-                LogException("queue safe instant revive", ex);
+                LogException("queue stable delayed revive", ex);
             }
         }
 
-        private static IEnumerator RunSafeInstantRevive(PlayerDeathHead head, ReviveState state)
+        private static IEnumerator RunStableDelayedRevive(PlayerDeathHead head, ReviveState state)
         {
-            yield return new WaitForEndOfFrame();
-            yield return new WaitForFixedUpdate();
+            float reviveAllowedAt = Time.time + ModConfig.SafeStableDelayedReviveDelay();
 
-            if (state != null)
+            while (true)
             {
-                state.ReviveQueued = false;
-            }
+                if (head == null ||
+                    ModConfig.EnableInstantExtractionRevive == null ||
+                    !ModConfig.EnableInstantExtractionRevive.Value ||
+                    !IsHostOrSingleplayer() ||
+                    !IsTriggered(head) ||
+                    head.playerAvatar == null)
+                {
+                    if (state != null)
+                    {
+                        state.ReviveQueued = false;
+                    }
 
-            if (head == null ||
-                ModConfig.EnableInstantExtractionRevive == null ||
-                !ModConfig.EnableInstantExtractionRevive.Value ||
-                !IsHostOrSingleplayer() ||
-                !IsTriggered(head) ||
-                head.playerAvatar == null)
-            {
-                DebugLog("safe instant revive aborted before attempt; death head/player state changed.");
+                    DebugLog("stable delayed revive aborted before attempt; death head/player state changed.");
+                    yield break;
+                }
+
+                bool roomCheckInside;
+                bool headInside;
+                bool fallbackInside;
+                bool inside = IsInsideExtractionPoint(head, out roomCheckInside, out headInside, out fallbackInside);
+                if (!inside)
+                {
+                    if (state != null)
+                    {
+                        state.ReviveQueued = false;
+                    }
+
+                    DebugLogState(state, "stable delayed revive aborted; head left extraction point. roomCheck=" + roomCheckInside + ", headField=" + headInside + ", fallback=" + fallbackInside + ".");
+                    yield break;
+                }
+
+                if (Time.time < reviveAllowedAt)
+                {
+                    DebugLogState(state, "stable delayed revive waiting for delay. remaining=" + Mathf.Max(0f, reviveAllowedAt - Time.time).ToString("F2") + ", roomCheck=" + roomCheckInside + ", headField=" + headInside + ".");
+                    yield return null;
+                    continue;
+                }
+
+                if (!ReviveDiagnostics.AreCriticalDependenciesReadyNoLog(head.playerAvatar))
+                {
+                    DebugLogState(state, "stable delayed revive waiting; vanilla ReviveRPC dependencies are not ready. " + ReviveDiagnostics.BuildReadinessReport(head.playerAvatar, false));
+                    yield return null;
+                    continue;
+                }
+
+                if (state != null)
+                {
+                    state.ReviveQueued = false;
+                }
+
+                ExecuteReviveAttempt(head, state, roomCheckInside, headInside, fallbackInside, "stable delayed revive", false);
                 yield break;
             }
-
-            bool roomCheckInside;
-            bool headInside;
-            bool fallbackInside;
-            bool inside = IsInsideExtractionPoint(head, out roomCheckInside, out headInside, out fallbackInside);
-            if (!inside)
-            {
-                DebugLogState(state, "safe instant revive aborted; head left extraction point. roomCheck=" + roomCheckInside + ", headField=" + headInside + ", fallback=" + fallbackInside + ".");
-                yield break;
-            }
-
-            ExecuteReviveAttempt(head, state, roomCheckInside, headInside, fallbackInside, "safe instant revive");
         }
 
-        private static void ExecuteReviveAttempt(PlayerDeathHead head, ReviveState state, bool roomCheckInside, bool headInside, bool fallbackInside, string stage)
+        private static void ExecuteReviveAttempt(PlayerDeathHead head, ReviveState state, bool roomCheckInside, bool headInside, bool fallbackInside, string stage, bool requirePreflight)
         {
             if (head == null || head.playerAvatar == null)
             {
@@ -313,18 +385,26 @@ namespace FidelityReviveFix
             Vector3 expectedPosition;
             bool hasExpectedPosition = TryGetExpectedRevivePosition(head, out expectedPosition);
 
+            if (requirePreflight && !ReviveDiagnostics.AreCriticalDependenciesReady(player, stage + " preflight"))
+            {
+                DebugLogState(state, stage + ": revive delayed; vanilla ReviveRPC dependencies are not ready.");
+                return;
+            }
+
             SetExtractionState(head, true);
-            ClientReviveProtection.ApplyImmediate(player, hasExpectedPosition, expectedPosition, "pre revive protection", false);
 
             bool hadException;
             bool successObserved;
             bool completed = TryRevive(head, state, roomCheckInside, headInside, fallbackInside, stage, hasExpectedPosition, expectedPosition, out hadException, out successObserved);
-            if (completed && state != null)
+            if (completed && !hadException && state != null)
             {
                 state.ReviveCompleted = true;
             }
 
-            StartLocalProtection(player, hasExpectedPosition, expectedPosition, hadException ? "failed revive protection" : "post revive protection", true);
+            if (hadException)
+            {
+                DebugLogState(state, stage + ": skipped post revive protection because vanilla ReviveRPC threw.");
+            }
         }
 
         private static bool TryRevive(PlayerDeathHead head, ReviveState state, bool roomCheckInside, bool headInside, bool fallbackInside, string stage, bool hasExpectedPosition, Vector3 expectedPosition, out bool hadException, out bool successObserved)
@@ -334,7 +414,7 @@ namespace FidelityReviveFix
 
             try
             {
-                DebugLogState(state, stage + ": revive attempt. roomCheck=" + roomCheckInside + ", headFieldBefore=" + headInside + ", fallback=" + fallbackInside + ", expectedPosition=" + FormatExpectedPosition(hasExpectedPosition, expectedPosition) + ", repoFidelityProtection=" + ClientReviveProtection.WouldRunFor(head.playerAvatar) + ".");
+                DebugLogState(state, stage + ": revive attempt. effectivePolicy=" + ModConfig.EffectiveReviveTimingPolicy() + ", roomCheck=" + roomCheckInside + ", headFieldBefore=" + headInside + ", fallback=" + fallbackInside + ", expectedPosition=" + FormatExpectedPosition(hasExpectedPosition, expectedPosition) + ", repoFidelityProtection=" + ClientReviveProtection.WouldRunFor(head.playerAvatar) + ".");
                 head.Revive();
                 successObserved = HasReviveClearlySucceeded(head);
                 bool multiplayer = IsMultiplayer();
@@ -373,7 +453,11 @@ namespace FidelityReviveFix
                 }
             }
 
-            fallbackInside = IsIndependentlyInsideExtractionPoint(head, check);
+            if (IsFallbackExtractionDetectionEnabled())
+            {
+                fallbackInside = IsIndependentlyInsideExtractionPoint(head, check);
+            }
+
             return headInside || fallbackInside;
         }
 
@@ -384,15 +468,10 @@ namespace FidelityReviveFix
                 return true;
             }
 
-            if (!IsTriggered(head))
-            {
-                return true;
-            }
-
             PlayerAvatar player = head.playerAvatar;
             if (player == null)
             {
-                return false;
+                return !IsTriggered(head);
             }
 
             bool deadSet = GetBool(PlayerAvatarDeadSetField, player, true, "PlayerAvatar.deadSet");
@@ -438,7 +517,7 @@ namespace FidelityReviveFix
                     mask,
                     QueryTriggerInteraction.Collide);
 
-                return AnyExtractionRoomVolume(count);
+                return AnyExtractionRoomVolume(count) && IsNearKnownExtractionPoint(head.transform.position);
             }
 
             int fallbackCount = Physics.OverlapSphereNonAlloc(
@@ -448,7 +527,53 @@ namespace FidelityReviveFix
                 ~0,
                 QueryTriggerInteraction.Collide);
 
-            return AnyExtractionRoomVolume(fallbackCount);
+            return AnyExtractionRoomVolume(fallbackCount) && IsNearKnownExtractionPoint(head.transform.position);
+        }
+
+        private static bool IsFallbackExtractionDetectionEnabled()
+        {
+            return ModConfig.EnableFallbackExtractionDetection != null &&
+                ModConfig.EnableFallbackExtractionDetection.Value;
+        }
+
+        private static bool IsNearKnownExtractionPoint(Vector3 position)
+        {
+            const float maxDistance = 12f;
+
+            try
+            {
+                if (RoundDirector.instance == null)
+                {
+                    return false;
+                }
+
+                ExtractionPoint current = GetField<ExtractionPoint>(RoundDirectorExtractionPointCurrentField, RoundDirector.instance);
+                if (current != null && Vector3.Distance(position, current.transform.position) <= maxDistance)
+                {
+                    return true;
+                }
+
+                List<GameObject> extractionPoints = GetField<List<GameObject>>(RoundDirectorExtractionPointListField, RoundDirector.instance);
+                if (extractionPoints == null)
+                {
+                    return false;
+                }
+
+                for (int i = 0; i < extractionPoints.Count; i++)
+                {
+                    GameObject extractionPoint = extractionPoints[i];
+                    if (extractionPoint != null && Vector3.Distance(position, extractionPoint.transform.position) <= maxDistance)
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLog("Known extraction point fallback check failed: " + ex.Message);
+            }
+
+            return false;
         }
 
         private static LayerMask GetRoomVolumeMask(RoomVolumeCheck check)
@@ -545,23 +670,6 @@ namespace FidelityReviveFix
             }
         }
 
-        private static void StartLocalProtection(PlayerAvatar player, bool hasExpectedPosition, Vector3 expectedPosition, string reason, bool allowPositionRepair)
-        {
-            if (Plugin.Instance == null || !ClientReviveProtection.WouldRunFor(player))
-            {
-                return;
-            }
-
-            try
-            {
-                Plugin.Instance.StartProtectionRoutine(player, hasExpectedPosition, expectedPosition, reason, allowPositionRepair);
-            }
-            catch (Exception ex)
-            {
-                LogException(reason, ex);
-            }
-        }
-
         private static bool IsHostOrSingleplayer()
         {
             try
@@ -607,6 +715,24 @@ namespace FidelityReviveFix
             }
 
             return defaultValue;
+        }
+
+        internal static T GetField<T>(FieldInfo field, object instance) where T : class
+        {
+            if (field == null || instance == null)
+            {
+                return null;
+            }
+
+            try
+            {
+                return field.GetValue(instance) as T;
+            }
+            catch (Exception ex)
+            {
+                DebugLog("Field read failed: " + ex.Message);
+                return null;
+            }
         }
 
         private static string GetPlayerBool(PlayerDeathHead head, FieldInfo field, string name)
@@ -717,10 +843,6 @@ namespace FidelityReviveFix
     internal static class ClientReviveProtection
     {
         private const string REPOFidelityGuid = "Vippy.REPOFidelity";
-        private const float PositionRepairDropThreshold = 2f;
-        private const float PositionRepairDistanceThreshold = 12f;
-        private const float PlayerTransformDriftThreshold = 3f;
-
         private static readonly FieldInfo SpectateCameraMainCameraField =
             typeof(SpectateCamera).GetField("MainCamera", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
 
@@ -747,15 +869,15 @@ namespace FidelityReviveFix
                 return;
             }
 
-            Plugin.Instance.StartProtectionRoutine(player, false, Vector3.zero, "post revive rpc protection", false);
+            Plugin.Instance.StartProtectionRoutine(player, false, Vector3.zero, "post revive rpc protection");
         }
 
         internal static IEnumerator Run(PlayerAvatar player)
         {
-            return Run(player, false, Vector3.zero, "post revive protection", false);
+            return Run(player, false, Vector3.zero, "post revive protection");
         }
 
-        internal static IEnumerator Run(PlayerAvatar player, bool hasExpectedPosition, Vector3 expectedPosition, string reason, bool allowPositionRepair)
+        internal static IEnumerator Run(PlayerAvatar player, bool hasExpectedPosition, Vector3 expectedPosition, string reason)
         {
             if (!WouldRunFor(player))
             {
@@ -764,26 +886,16 @@ namespace FidelityReviveFix
 
             float endTime = Time.time + ModConfig.SafeProtectionWindow();
             DebugLog("Starting local " + reason + ".");
+            yield return null;
 
             while (Time.time <= endTime)
             {
-                ApplyLocalFixes(player, hasExpectedPosition, expectedPosition, allowPositionRepair);
+                ApplyLocalFixes(player);
                 yield return null;
             }
 
-            ApplyLocalFixes(player, hasExpectedPosition, expectedPosition, allowPositionRepair);
+            ApplyLocalFixes(player);
             DebugLog("Finished local " + reason + ".");
-        }
-
-        internal static void ApplyImmediate(PlayerAvatar player, bool hasExpectedPosition, Vector3 expectedPosition, string reason, bool allowPositionRepair)
-        {
-            if (!WouldRunFor(player))
-            {
-                return;
-            }
-
-            DebugLog(reason + ".");
-            ApplyLocalFixes(player, hasExpectedPosition, expectedPosition, allowPositionRepair);
         }
 
         internal static bool WouldRunFor(PlayerAvatar player)
@@ -824,7 +936,7 @@ namespace FidelityReviveFix
             return player == PlayerAvatar.instance;
         }
 
-        private static bool IsREPOFidelityLoaded()
+        internal static bool IsREPOFidelityLoaded()
         {
             try
             {
@@ -836,31 +948,18 @@ namespace FidelityReviveFix
             }
         }
 
-        private static void ApplyLocalFixes(PlayerAvatar player, bool hasExpectedPosition, Vector3 expectedPosition, bool allowPositionRepair)
+        private static void ApplyLocalFixes(PlayerAvatar player)
         {
             if (player == null)
             {
                 player = PlayerAvatar.instance;
             }
 
-            SpectateCamera spectate = SpectateCamera.instance;
-            if (spectate != null)
-            {
-                TryStopDeathSpectate(spectate);
-                if (player != null)
-                {
-                    TryUpdateSpectatePlayer(spectate, player);
-                }
-            }
+            InspectSpectateCamera(SpectateCamera.instance);
 
             if (player != null && player.localCamera != null)
             {
                 SafeCall(player.localCamera.Teleported, "PlayerLocalCamera.Teleported");
-            }
-
-            if (allowPositionRepair)
-            {
-                RepairLocalPositionIfNeeded(player, hasExpectedPosition, expectedPosition);
             }
 
             EnsureObject("CameraZoom.Instance", CameraZoom.Instance);
@@ -873,84 +972,18 @@ namespace FidelityReviveFix
             }
         }
 
-        private static void RepairLocalPositionIfNeeded(PlayerAvatar player, bool hasExpectedPosition, Vector3 expectedPosition)
+        private static void InspectSpectateCamera(SpectateCamera spectate)
         {
-            if (!hasExpectedPosition || player == null || !IsLocalPlayer(player))
+            if (spectate == null)
             {
+                DebugLog("SpectateCamera.instance is not ready during local revive protection.");
                 return;
-            }
-
-            try
-            {
-                Vector3 avatarPosition = player.transform.position;
-                bool droppedBelowRevive = avatarPosition.y < expectedPosition.y - PositionRepairDropThreshold;
-                bool farFromRevive = Vector3.Distance(avatarPosition, expectedPosition) > PositionRepairDistanceThreshold;
-                bool playerTransformDrift = player.playerTransform != null &&
-                    Vector3.Distance(player.playerTransform.position, avatarPosition) > PlayerTransformDriftThreshold;
-
-                if (!droppedBelowRevive && !farFromRevive && !playerTransformDrift)
-                {
-                    return;
-                }
-
-                player.transform.position = expectedPosition;
-
-                if (player.playerTransform != null)
-                {
-                    player.playerTransform.position = expectedPosition;
-                }
-
-                if (CameraPosition.instance != null)
-                {
-                    CameraPosition.instance.transform.position = expectedPosition;
-                }
-
-                if (player.localCamera != null)
-                {
-                    SafeCall(player.localCamera.Teleported, "PlayerLocalCamera.Teleported after position repair");
-                }
-
-                DebugLog("Repaired local revive position to expected extraction revive point.");
-            }
-            catch (Exception ex)
-            {
-                InstantReviveController.LogException("local revive position repair", ex);
-            }
-        }
-
-        private static void TryStopDeathSpectate(SpectateCamera spectate)
-        {
-            bool isDeathState;
-            try
-            {
-                isDeathState = spectate.CheckState(SpectateCamera.State.Death);
-            }
-            catch
-            {
-                isDeathState = false;
-            }
-
-            if (isDeathState)
-            {
-                SafeCall(spectate.StopSpectate, "SpectateCamera.StopSpectate");
             }
 
             EnsureObject("SpectateCamera.MainCamera", GetField<Camera>(SpectateCameraMainCameraField, spectate));
             EnsureObject("SpectateCamera.ParentObject", GetField<Transform>(SpectateCameraParentObjectField, spectate));
             EnsureObject("SpectateCamera.PreviousParent", GetField<Transform>(SpectateCameraPreviousParentField, spectate));
             EnsureObject("SpectateCamera.normalTransformPivot", spectate.normalTransformPivot);
-        }
-
-        private static void TryUpdateSpectatePlayer(SpectateCamera spectate, PlayerAvatar player)
-        {
-            try
-            {
-                spectate.UpdatePlayer(player);
-            }
-            catch (Exception ex)
-            {
-                DebugLog("SpectateCamera.UpdatePlayer failed: " + ex.Message);
-            }
         }
 
         private static void SafeCall(Action action, string name)
@@ -1000,6 +1033,177 @@ namespace FidelityReviveFix
         }
     }
 
+    internal static class ReviveDiagnostics
+    {
+        private static readonly FieldInfo PlayerAvatarPlayerDeathHeadField =
+            typeof(PlayerAvatar).GetField("playerDeathHead", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        private static readonly FieldInfo PlayerAvatarPlayerAvatarCollisionField =
+            typeof(PlayerAvatar).GetField("playerAvatarCollision", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        private static readonly FieldInfo PlayerAvatarIsLocalField =
+            typeof(PlayerAvatar).GetField("isLocal", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        private static readonly FieldInfo PlayerDeathHeadPhysGrabObjectField =
+            typeof(PlayerDeathHead).GetField("physGrabObject", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        internal static bool AreCriticalDependenciesReady(PlayerAvatar player, string reason)
+        {
+            PlayerDeathHead head = GetDeathHead(player);
+            bool ready = player != null &&
+                head != null &&
+                GetPhysGrabObject(head) != null &&
+                player.playerHealth != null &&
+                player.playerAvatarVisuals != null &&
+                player.playerDeathEffects != null &&
+                player.playerReviveEffects != null &&
+                GetAvatarCollision(player) != null &&
+                player.RoomVolumeCheck != null;
+
+            if (player != null && IsLocalPlayer(player))
+            {
+                ready = ready &&
+                    player.playerTransform != null &&
+                    player.playerTransform.parent != null &&
+                    CameraAim.Instance != null &&
+                    CameraPosition.instance != null &&
+                    GameDirector.instance != null &&
+                    SpectateCamera.instance != null &&
+                    PlayerController.instance != null &&
+                    CameraGlitch.Instance != null;
+            }
+
+            if (ModConfig.DebugLogging != null && ModConfig.DebugLogging.Value)
+            {
+                Plugin.Log.LogInfo(reason + ": " + BuildReadinessReport(player, ready));
+            }
+
+            return ready;
+        }
+
+        internal static void LogReviveRpcPrefix(PlayerAvatar player)
+        {
+            if (ModConfig.DebugLogging == null || !ModConfig.DebugLogging.Value)
+            {
+                return;
+            }
+
+            Plugin.Log.LogInfo("ReviveRPC prefix: " + BuildReadinessReport(player, AreCriticalDependenciesReadyNoLog(player)));
+        }
+
+        internal static bool AreCriticalDependenciesReadyNoLog(PlayerAvatar player)
+        {
+            if (player == null ||
+                player.playerHealth == null ||
+                player.playerAvatarVisuals == null ||
+                player.playerDeathEffects == null ||
+                player.playerReviveEffects == null ||
+                player.RoomVolumeCheck == null)
+            {
+                return false;
+            }
+
+            PlayerDeathHead head = GetDeathHead(player);
+            if (head == null || GetPhysGrabObject(head) == null || GetAvatarCollision(player) == null)
+            {
+                return false;
+            }
+
+            if (!IsLocalPlayer(player))
+            {
+                return true;
+            }
+
+            return player.playerTransform != null &&
+                player.playerTransform.parent != null &&
+                CameraAim.Instance != null &&
+                CameraPosition.instance != null &&
+                GameDirector.instance != null &&
+                SpectateCamera.instance != null &&
+                PlayerController.instance != null &&
+                CameraGlitch.Instance != null;
+        }
+
+        internal static string BuildReadinessReport(PlayerAvatar player, bool ready)
+        {
+            if (player == null)
+            {
+                return "ready=False, playerAvatar=null.";
+            }
+
+            PlayerDeathHead head = GetDeathHead(player);
+            bool local = IsLocalPlayer(player);
+            string playerTransformParent = player.playerTransform == null
+                ? "unknown"
+                : FormatReady(player.playerTransform.parent != null);
+
+            return "ready=" + ready +
+                ", isLocal=" + local +
+                ", playerDeathHead=" + FormatReady(head != null) +
+                ", physGrabObject=" + FormatReady(head != null && GetPhysGrabObject(head) != null) +
+                ", playerHealth=" + FormatReady(player.playerHealth != null) +
+                ", playerAvatarVisuals=" + FormatReady(player.playerAvatarVisuals != null) +
+                ", playerDeathEffects=" + FormatReady(player.playerDeathEffects != null) +
+                ", playerReviveEffects=" + FormatReady(player.playerReviveEffects != null) +
+                ", playerAvatarCollision=" + FormatReady(GetAvatarCollision(player) != null) +
+                ", playerTransform=" + FormatReady(player.playerTransform != null) +
+                ", playerTransform.parent=" + playerTransformParent +
+                ", CameraAim.Instance=" + FormatReady(CameraAim.Instance != null) +
+                ", CameraPosition.instance=" + FormatReady(CameraPosition.instance != null) +
+                ", GameDirector.instance=" + FormatReady(GameDirector.instance != null) +
+                ", SpectateCamera.instance=" + FormatReady(SpectateCamera.instance != null) +
+                ", PlayerController.instance=" + FormatReady(PlayerController.instance != null) +
+                ", CameraGlitch.Instance=" + FormatReady(CameraGlitch.Instance != null) +
+                ", RoomVolumeCheck=" + FormatReady(player.RoomVolumeCheck != null) +
+                ".";
+        }
+
+        private static bool IsLocalPlayer(PlayerAvatar player)
+        {
+            if (player == null)
+            {
+                return false;
+            }
+
+            try
+            {
+                if (PlayerAvatarIsLocalField != null)
+                {
+                    object value = PlayerAvatarIsLocalField.GetValue(player);
+                    if (value is bool)
+                    {
+                        return (bool)value;
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            return player == PlayerAvatar.instance;
+        }
+
+        private static PlayerDeathHead GetDeathHead(PlayerAvatar player)
+        {
+            return InstantReviveController.GetField<PlayerDeathHead>(PlayerAvatarPlayerDeathHeadField, player);
+        }
+
+        private static PhysGrabObject GetPhysGrabObject(PlayerDeathHead head)
+        {
+            return InstantReviveController.GetField<PhysGrabObject>(PlayerDeathHeadPhysGrabObjectField, head);
+        }
+
+        private static PlayerAvatarCollision GetAvatarCollision(PlayerAvatar player)
+        {
+            return InstantReviveController.GetField<PlayerAvatarCollision>(PlayerAvatarPlayerAvatarCollisionField, player);
+        }
+
+        private static string FormatReady(bool ready)
+        {
+            return ready ? "ok" : "null";
+        }
+    }
+
     [HarmonyPatch(typeof(PlayerDeathHead), "Update")]
     internal static class PlayerDeathHeadUpdatePatch
     {
@@ -1012,6 +1216,11 @@ namespace FidelityReviveFix
     [HarmonyPatch(typeof(PlayerAvatar), "ReviveRPC")]
     internal static class PlayerAvatarReviveRpcPatch
     {
+        private static void Prefix(PlayerAvatar __instance)
+        {
+            ReviveDiagnostics.LogReviveRpcPrefix(__instance);
+        }
+
         private static void Postfix(PlayerAvatar __instance)
         {
             ClientReviveProtection.OnReviveRpc(__instance);

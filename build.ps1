@@ -9,7 +9,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 $modName = "FidelityReviveFix"
-$modVersion = "0.1.2"
+$modVersion = "0.1.4"
 $authorName = "AngelcoMilk"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -98,10 +98,17 @@ function Test-GameHookTargets {
         @{ Type = "PlayerDeathHead"; Field = "roomVolumeCheck" },
         @{ Type = "PlayerDeathHead"; Field = "inExtractionPoint" },
         @{ Type = "PlayerDeathHead"; Field = "physGrabObject" },
+        @{ Type = "PlayerAvatar"; Field = "playerDeathHead" },
         @{ Type = "PlayerAvatar"; Field = "deadSet" },
         @{ Type = "PlayerAvatar"; Field = "isDisabled" },
         @{ Type = "PlayerAvatar"; Field = "playerTransform" },
+        @{ Type = "PlayerAvatar"; Field = "playerAvatarVisuals" },
+        @{ Type = "PlayerAvatar"; Field = "playerDeathEffects" },
+        @{ Type = "PlayerAvatar"; Field = "playerReviveEffects" },
+        @{ Type = "PlayerAvatar"; Field = "playerAvatarCollision" },
+        @{ Type = "PlayerAvatar"; Field = "RoomVolumeCheck" },
         @{ Type = "PhysGrabObject"; Field = "centerPoint" },
+        @{ Type = "CameraAim"; Field = "Instance" },
         @{ Type = "CameraPosition"; Field = "instance" },
         @{ Type = "RoomVolumeCheck"; Field = "inExtractionPoint" },
         @{ Type = "RoomVolumeCheck"; Field = "Mask" },
