@@ -1,0 +1,10 @@
+{
+    "name": "FidelityReviveFix",
+    "version_number": "0.1.0",
+    "author": "AngelcoMilk",
+    "website_url": "https://github.com/AngelcoMilk/FidelityReviveFix",
+    "description": "Instant extraction-point revive for hosts, with optional client-side REPOFidelity protection against revive camera and void-fall issues.",
+    "dependencies": [
+        "BepInEx-BepInExPack-5.4.2305"
+    ]
+}
