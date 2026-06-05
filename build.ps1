@@ -8,8 +8,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$modName = "FidelityReviveFix"
-$modVersion = "0.1.5"
+$modName = "HellRevival"
+$modVersion = "0.1.6"
 $authorName = "AngelcoMilk"
 
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -109,6 +109,7 @@ function Test-GameHookTargets {
         @{ Type = "PlayerDeathHead"; Method = "Update"; Parameters = @() },
         @{ Type = "PlayerDeathHead"; Method = "Revive"; Parameters = @() },
         @{ Type = "PlayerAvatar"; Method = "ReviveRPC"; Parameters = @("System.Boolean", "Photon.Pun.PhotonMessageInfo") },
+        @{ Type = "PlayerHealth"; Method = "HealOther"; Parameters = @("System.Int32", "System.Boolean") },
         @{ Type = "Photon.Pun.PhotonNetwork"; Method = "get_LocalPlayer"; Parameters = @() },
         @{ Type = "Photon.Pun.PhotonNetwork"; Method = "get_PlayerList"; Parameters = @() },
         @{ Type = "Photon.Realtime.Player"; Method = "SetCustomProperties"; Parameters = @("ExitGames.Client.Photon.Hashtable", "ExitGames.Client.Photon.Hashtable", "Photon.Realtime.WebFlags") },
@@ -130,6 +131,9 @@ function Test-GameHookTargets {
         @{ Type = "PlayerAvatar"; Field = "playerReviveEffects" },
         @{ Type = "PlayerAvatar"; Field = "playerAvatarCollision" },
         @{ Type = "PlayerAvatar"; Field = "RoomVolumeCheck" },
+        @{ Type = "PlayerHealth"; Field = "health" },
+        @{ Type = "PlayerHealth"; Field = "maxHealth" },
+        @{ Type = "PlayerHealth"; Field = "photonView" },
         @{ Type = "PhysGrabObject"; Field = "centerPoint" },
         @{ Type = "CameraAim"; Field = "Instance" },
         @{ Type = "CameraPosition"; Field = "instance" },
@@ -216,7 +220,7 @@ function Test-GameHookTargets {
         throw "Harmony hook target validation failed:`n$($errors -join "`n")"
     }
 
-    Write-Host "Validated FidelityReviveFix hook targets against $AssemblyPath"
+    Write-Host "Validated HellRevival hook targets against $AssemblyPath"
 }
 
 Test-GameHookTargets -AssemblyPath (Join-Path $managed "Assembly-CSharp.dll") -CecilPath (Join-Path $bepCore "Mono.Cecil.dll")
