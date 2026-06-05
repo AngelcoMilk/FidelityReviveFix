@@ -12,14 +12,14 @@ using Photon.Pun;
 using Photon.Realtime;
 using UnityEngine;
 
-namespace FidelityReviveFix
+namespace HellRevival
 {
     [BepInPlugin(PluginGuid, PluginName, PluginVersion)]
     public sealed class Plugin : BaseUnityPlugin
     {
-        public const string PluginGuid = "AngelcoMilk.FidelityReviveFix";
-        public const string PluginName = "FidelityReviveFix";
-        public const string PluginVersion = "0.1.5";
+        public const string PluginGuid = "AngelcoMilk.HellRevival";
+        public const string PluginName = "HellRevival";
+        public const string PluginVersion = "0.1.6";
 
         internal static Plugin Instance;
         internal static ManualLogSource Log;
@@ -109,92 +109,63 @@ namespace FidelityReviveFix
 
     internal static class ModConfig
     {
+        private const float FixedStableDelayedReviveDelay = 0.75f;
+        private const float FixedProtectionWindow = 0.75f;
+
         internal static ConfigEntry<bool> EnableInstantExtractionRevive;
-        internal static ConfigEntry<ReviveTimingPolicy> ReviveTimingPolicyEntry;
-        internal static ConfigEntry<UnknownClientPolicy> UnknownClientPolicyEntry;
-        internal static ConfigEntry<float> StableDelayedReviveDelay;
-        internal static ConfigEntry<bool> EnableFallbackExtractionDetection;
-        internal static ConfigEntry<ClientProtectionMode> REPOFidelityClientProtection;
-        internal static ConfigEntry<float> PostReviveProtectionWindow;
-        internal static ConfigEntry<bool> DebugLogging;
+        internal static ConfigEntry<int> ReviveHealth;
 
         internal static void Bind(ConfigFile config)
         {
             EnableInstantExtractionRevive = config.Bind(
-                "Instant Revive",
-                "Enable Instant Extraction Revive",
+                "General",
+                "Enable Automatic Revive",
                 true,
-                "Host/singleplayer only. When a triggered death head enters an extraction point, immediately triggers the vanilla revive.");
+                "Host/singleplayer only. Automatically revives a player when their death head enters the extraction point.");
 
-            ReviveTimingPolicyEntry = config.Bind(
-                "Instant Revive",
-                "Revive Timing Policy",
-                ReviveTimingPolicy.Auto,
-                "Auto uses the revived player's reported REPOFidelity status in multiplayer, or local REPOFidelity status in singleplayer. Instant revives during PlayerDeathHead.Update. StableDelayed waits briefly for vanilla camera/spectate state before reviving.");
-
-            UnknownClientPolicyEntry = config.Bind(
-                "Instant Revive",
-                "Unknown Client Policy",
-                UnknownClientPolicy.HostLocal,
-                "HostLocal uses the host/local policy when a remote player did not report FidelityReviveFix capabilities. StableDelayed conservatively delays unknown remote players.");
-
-            StableDelayedReviveDelay = config.Bind(
-                "Instant Revive",
-                "Stable Delayed Revive Delay",
-                0.75f,
+            ReviveHealth = config.Bind(
+                "General",
+                "Revive Health",
+                20,
                 new ConfigDescription(
-                    "Seconds to wait before automatic revive when StableDelayed timing is active.",
-                    new AcceptableValueRange<float>(0.1f, 3.0f)));
-
-            EnableFallbackExtractionDetection = config.Bind(
-                "Instant Revive",
-                "Enable Fallback Extraction Detection",
-                false,
-                "Diagnostic compatibility fallback. Disabled by default so revive follows vanilla extraction point state. When enabled, an extra extraction-volume scan is allowed only near known extraction points.");
-
-            REPOFidelityClientProtection = config.Bind(
-                "REPOFidelity Compatibility",
-                "REPOFidelity Client Protection",
-                ClientProtectionMode.Auto,
-                "Auto enables local protection only when Vippy.REPOFidelity is loaded. Always runs it after every revive. Off disables the client-side compatibility protection.");
-
-            PostReviveProtectionWindow = config.Bind(
-                "REPOFidelity Compatibility",
-                "Post Revive Protection Window",
-                0.75f,
-                new ConfigDescription(
-                    "Seconds to keep refreshing non-destructive local camera/audio/post-processing state after vanilla ReviveRPC returns.",
-                    new AcceptableValueRange<float>(0.1f, 3.0f)));
-
-            DebugLogging = config.Bind(
-                "Diagnostics",
-                "Debug Logging",
-                false,
-                "Write instant revive and REPOFidelity client-protection details to the BepInEx log.");
+                    "Health after an extraction revive. Vanilla extraction revive gives 1 health; 20 matches More-Revive-HP's default +19 behavior.",
+                    new AcceptableValueRange<int>(1, 100)));
         }
 
         internal static float SafeProtectionWindow()
         {
-            return PostReviveProtectionWindow == null
-                ? 0.75f
-                : Mathf.Clamp(PostReviveProtectionWindow.Value, 0.1f, 3.0f);
+            return FixedProtectionWindow;
         }
 
         internal static float SafeStableDelayedReviveDelay()
         {
-            return StableDelayedReviveDelay == null
-                ? 0.75f
-                : Mathf.Clamp(StableDelayedReviveDelay.Value, 0.1f, 3.0f);
+            return FixedStableDelayedReviveDelay;
         }
 
         internal static ReviveTimingPolicy SafeReviveTimingPolicy()
         {
-            return ReviveTimingPolicyEntry == null ? ReviveTimingPolicy.Auto : ReviveTimingPolicyEntry.Value;
+            return ReviveTimingPolicy.Auto;
         }
 
         internal static UnknownClientPolicy SafeUnknownClientPolicy()
         {
-            return UnknownClientPolicyEntry == null ? UnknownClientPolicy.HostLocal : UnknownClientPolicyEntry.Value;
+            return UnknownClientPolicy.HostLocal;
+        }
+
+        internal static bool ShouldOverrideReviveHealth()
+        {
+            return true;
+        }
+
+        internal static int SafeMinimumReviveHealth(int maxHealth)
+        {
+            int configured = ReviveHealth == null ? 20 : ReviveHealth.Value;
+            return Mathf.Clamp(configured, 1, Mathf.Max(1, maxHealth));
+        }
+
+        internal static bool IsDebugLoggingEnabled()
+        {
+            return false;
         }
 
         internal static ReviveTimingPolicy EffectiveReviveTimingPolicy(PlayerAvatar targetPlayer, out string reason)
@@ -312,11 +283,6 @@ namespace FidelityReviveFix
                 return;
             }
 
-            if (state.FirstInsideTime <= 0f)
-            {
-                state.FirstInsideTime = Time.time;
-            }
-
             bool roomCheckInside;
             bool headInside;
             bool fallbackInside;
@@ -324,8 +290,14 @@ namespace FidelityReviveFix
 
             if (!inside)
             {
+                state.FirstInsideTime = 0f;
                 DebugLogState(state, "Revive scan: host=True, triggered=True, roomCheck=" + roomCheckInside + ", headField=" + headInside + ", fallback=" + fallbackInside + ", inside=False.");
                 return;
+            }
+
+            if (state.FirstInsideTime <= 0f)
+            {
+                state.FirstInsideTime = Time.time;
             }
 
             if (state.LastAttemptTime > 0f && Time.time - state.LastAttemptTime < RetryIntervalSeconds)
@@ -394,9 +366,24 @@ namespace FidelityReviveFix
                     if (state != null)
                     {
                         state.ReviveQueued = false;
+                        state.FirstInsideTime = 0f;
                     }
 
                     DebugLogState(state, "stable delayed revive aborted; head left extraction point. roomCheck=" + roomCheckInside + ", headField=" + headInside + ", fallback=" + fallbackInside + ".");
+                    yield break;
+                }
+
+                string currentPolicyReason;
+                ReviveTimingPolicy currentPolicy = ModConfig.EffectiveReviveTimingPolicy(head.playerAvatar, out currentPolicyReason);
+                if (currentPolicy == ReviveTimingPolicy.Instant)
+                {
+                    if (state != null)
+                    {
+                        state.ReviveQueued = false;
+                    }
+
+                    DebugLogState(state, "stable delayed revive switched to instant after policy refresh. reason=" + currentPolicyReason + ".");
+                    ExecuteReviveAttempt(head, state, roomCheckInside, headInside, fallbackInside, "instant revive after policy refresh", false, currentPolicy, currentPolicyReason);
                     yield break;
                 }
 
@@ -585,8 +572,7 @@ namespace FidelityReviveFix
 
         private static bool IsFallbackExtractionDetectionEnabled()
         {
-            return ModConfig.EnableFallbackExtractionDetection != null &&
-                ModConfig.EnableFallbackExtractionDetection.Value;
+            return false;
         }
 
         private static bool IsNearKnownExtractionPoint(Vector3 position)
@@ -832,7 +818,7 @@ namespace FidelityReviveFix
 
         private static void DebugLogState(ReviveState state, string message)
         {
-            if (ModConfig.DebugLogging == null || !ModConfig.DebugLogging.Value || state == null)
+            if (!ModConfig.IsDebugLoggingEnabled() || state == null)
             {
                 return;
             }
@@ -848,7 +834,7 @@ namespace FidelityReviveFix
 
         private static void DebugLog(string message)
         {
-            if (ModConfig.DebugLogging != null && ModConfig.DebugLogging.Value)
+            if (ModConfig.IsDebugLoggingEnabled())
             {
                 Plugin.Log.LogInfo(message);
             }
@@ -878,7 +864,7 @@ namespace FidelityReviveFix
             }
 
             Plugin.Log.LogWarning(stage + " failed: " + report.GetType().Name + ": " + report.Message);
-            if (ModConfig.DebugLogging != null && ModConfig.DebugLogging.Value)
+            if (ModConfig.IsDebugLoggingEnabled())
             {
                 if (report.StackTrace != null)
                 {
@@ -953,17 +939,10 @@ namespace FidelityReviveFix
 
         internal static bool WouldRunFor(PlayerAvatar player)
         {
-            if (ModConfig.REPOFidelityClientProtection == null ||
-                ModConfig.REPOFidelityClientProtection.Value == ClientProtectionMode.Off ||
-                player == null ||
+            if (player == null ||
                 !IsLocalPlayer(player))
             {
                 return false;
-            }
-
-            if (ModConfig.REPOFidelityClientProtection.Value == ClientProtectionMode.Always)
-            {
-                return true;
             }
 
             return IsREPOFidelityLoaded();
@@ -1079,7 +1058,121 @@ namespace FidelityReviveFix
 
         private static void DebugLog(string message)
         {
-            if (ModConfig.DebugLogging != null && ModConfig.DebugLogging.Value)
+            if (ModConfig.IsDebugLoggingEnabled())
+            {
+                Plugin.Log.LogInfo(message);
+            }
+        }
+    }
+
+    internal static class ReviveHealthController
+    {
+        private static readonly FieldInfo PlayerHealthHealthField =
+            typeof(PlayerHealth).GetField("health", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        private static readonly FieldInfo PlayerHealthMaxHealthField =
+            typeof(PlayerHealth).GetField("maxHealth", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+        internal static void OnReviveRpc(PlayerAvatar player, bool revivedByTruck)
+        {
+            if (!ModConfig.ShouldOverrideReviveHealth() ||
+                player == null ||
+                player.playerHealth == null ||
+                !IsHostOrSingleplayer())
+            {
+                return;
+            }
+
+            if (revivedByTruck)
+            {
+                DebugLog("Skipped revive health override for truck revive.");
+                return;
+            }
+
+            int maxHealth = Mathf.Max(1, GetPlayerHealthInt(PlayerHealthMaxHealthField, player.playerHealth, 100, "PlayerHealth.maxHealth"));
+            int targetHealth = ModConfig.SafeMinimumReviveHealth(maxHealth);
+            int extraHealth = Mathf.Max(0, targetHealth - 1);
+            if (extraHealth <= 0)
+            {
+                DebugLog("Skipped revive health override because configured target is vanilla revive health.");
+                return;
+            }
+
+            int currentHealth = GetPlayerHealthInt(PlayerHealthHealthField, player.playerHealth, 0, "PlayerHealth.health");
+            if (IsOwnedByLocalClient(player) && currentHealth >= targetHealth)
+            {
+                DebugLog("Skipped revive health override because local owner health is already " + currentHealth + ".");
+                return;
+            }
+
+            try
+            {
+                player.playerHealth.HealOther(extraHealth, true);
+                DebugLog("Applied revive health override. target=" + targetHealth + ", extra=" + extraHealth + ", max=" + maxHealth + ", player=" + MultiplayerCapabilitySync.DescribePlayer(player) + ".");
+            }
+            catch (Exception ex)
+            {
+                Plugin.Log.LogWarning("HellRevival revive health override failed: " + ex.Message);
+            }
+        }
+
+        private static int GetPlayerHealthInt(FieldInfo field, PlayerHealth playerHealth, int defaultValue, string name)
+        {
+            if (field == null || playerHealth == null)
+            {
+                return defaultValue;
+            }
+
+            try
+            {
+                object value = field.GetValue(playerHealth);
+                if (value is int)
+                {
+                    return (int)value;
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLog(name + " read failed: " + ex.Message);
+            }
+
+            return defaultValue;
+        }
+
+        private static bool IsHostOrSingleplayer()
+        {
+            try
+            {
+                return SemiFunc.IsMasterClientOrSingleplayer();
+            }
+            catch
+            {
+                try
+                {
+                    return !GameManager.Multiplayer() || PhotonNetwork.IsMasterClient;
+                }
+                catch
+                {
+                    return true;
+                }
+            }
+        }
+
+        private static bool IsOwnedByLocalClient(PlayerAvatar player)
+        {
+            try
+            {
+                return player.photonView == null || player.photonView.IsMine;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void DebugLog(string message)
+        {
+            if (ModConfig.IsDebugLoggingEnabled())
             {
                 Plugin.Log.LogInfo(message);
             }
@@ -1269,7 +1362,7 @@ namespace FidelityReviveFix
 
         private static void DebugLog(string message)
         {
-            if (ModConfig.DebugLogging != null && ModConfig.DebugLogging.Value)
+            if (ModConfig.IsDebugLoggingEnabled())
             {
                 Plugin.Log.LogInfo(message);
             }
@@ -1316,7 +1409,7 @@ namespace FidelityReviveFix
                     CameraGlitch.Instance != null;
             }
 
-            if (ModConfig.DebugLogging != null && ModConfig.DebugLogging.Value)
+            if (ModConfig.IsDebugLoggingEnabled())
             {
                 Plugin.Log.LogInfo(reason + ": " + BuildReadinessReport(player, ready));
             }
@@ -1326,7 +1419,7 @@ namespace FidelityReviveFix
 
         internal static void LogReviveRpcPrefix(PlayerAvatar player)
         {
-            if (ModConfig.DebugLogging == null || !ModConfig.DebugLogging.Value)
+            if (!ModConfig.IsDebugLoggingEnabled())
             {
                 return;
             }
@@ -1464,8 +1557,9 @@ namespace FidelityReviveFix
             ReviveDiagnostics.LogReviveRpcPrefix(__instance);
         }
 
-        private static void Postfix(PlayerAvatar __instance)
+        private static void Postfix(PlayerAvatar __instance, bool _revivedByTruck)
         {
+            ReviveHealthController.OnReviveRpc(__instance, _revivedByTruck);
             ClientReviveProtection.OnReviveRpc(__instance);
         }
     }
